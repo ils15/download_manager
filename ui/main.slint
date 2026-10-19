@@ -1,311 +1,2027 @@
-import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+// =============================================================================
+// Independent Download Manager — Slint application shell
+//
+// Window architecture (classic download-manager layout, own visual identity):
+//
+//   Window
+//    ├── Menu bar      Tarefas · Arquivo · Downloads · Visualizar · Ajuda · Registro
+//    ├── Toolbar       large buttons: icon on top, label underneath
+//    ├── Notice strip  in-app notification (live region)
+//    ├── Body
+//    │    ├── Category tree   (left column, resizable, scrollable)
+//    │    ├── Splitter        (draggable divider)
+//    │    └── Download list   (right column, sticky header + virtualized rows)
+//    └── Status bar    counters, aggregate speed, last message
+//
+//   Popups: add download · options · history · about
+//
+// Every control is bound to real application state; nothing is decorative.
+// =============================================================================
 
+import { Button, ComboBox, LineEdit, ListView, ProgressIndicator, ScrollView, SpinBox, Switch } from "std-widgets.slint";
+
+// -----------------------------------------------------------------------------
+// Theme — own palette (Material inspired), all text pairs meet WCAG AA.
+// -----------------------------------------------------------------------------
+global Theme {
+    in property <color> window_bg: #eceff5;
+    in property <color> surface: #ffffff;
+    in property <color> surface_alt: #f6f8fc;
+    in property <color> surface_sunken: #f0f3f8;
+    in property <color> border: #d4dae5;
+    in property <color> border_strong: #a7b1c1;
+    in property <color> text_primary: #141a24;
+    in property <color> text_secondary: #414b5a;
+    in property <color> text_muted: #5c6675;
+    in property <color> accent: #2c46a8;
+    in property <color> accent_hover: #22398b;
+    in property <color> on_accent: #ffffff;
+    in property <color> accent_soft: #dee4f7;
+    in property <color> success: #10633a;
+    in property <color> warning: #7a4f00;
+    in property <color> danger: #a41d16;
+    in property <color> focus_ring: #1750c8;
+    in property <color> disabled: #6f7887;
+}
+
+// -----------------------------------------------------------------------------
+// Models shared with the Rust side.
+// -----------------------------------------------------------------------------
 export struct JobRow {
     id: string,
+    name: string,
+    url: string,
     details: string,
+    size_text: string,
+    status_text: string,
+    status_kind: string,
+    progress: float,
+    progress_text: string,
+    eta_text: string,
+    speed_text: string,
     priority: string,
-    can_set_priority: bool,
+    category: string,
     can_pause: bool,
     can_resume: bool,
     can_cancel: bool,
+    can_set_priority: bool,
 }
 
 export struct HistoryRow {
     details: string,
 }
 
+export struct CategoryNode {
+    id: string,
+    label: string,
+    icon_name: string,
+    depth: int,
+    expandable: bool,
+    supported: bool,
+}
+
+export struct MenuEntry {
+    entry_id: string,
+    label: string,
+    action: string,
+    enabled: bool,
+    separator_before: bool,
+    checked: bool,
+}
+
+// -----------------------------------------------------------------------------
+// AppIcon — original vector glyphs drawn with SVG path data (24x24 box).
+// No third-party artwork, no emoji, no IDM assets.
+// -----------------------------------------------------------------------------
+component AppIcon inherits Path {
+    in property <string> icon_name: "";
+    in property <color> icon_color: Theme.text_secondary;
+    in property <bool> stroked: root.outline_glyph(root.icon_name);
+    in property <length> icon_size: 18px;
+
+    // Outline glyphs are drawn with a stroke, solid glyphs are filled.
+    pure function outline_glyph(name: string) -> bool {
+        return name == "trash" || name == "trash-all" || name == "sliders" || name == "clock"
+            || name == "incomplete" || name == "complete" || name == "documents"
+            || name == "programs" || name == "video" || name == "file" || name == "grabber"
+            || name == "close";
+    }
+
+    pure function glyph(name: string) -> string {
+        return name == "plus" ? "M 10 4 L 14 4 L 14 10 L 20 10 L 20 14 L 14 14 L 14 20 L 10 20 L 10 14 L 4 14 L 4 10 L 10 10 Z"
+            : name == "play" ? "M 7 4 L 20 12 L 7 20 Z"
+            : name == "stop" ? "M 6 6 L 18 6 L 18 18 L 6 18 Z"
+            : name == "trash" ? "M 5 7 L 19 7 L 18 20 L 6 20 Z M 9 7 L 9 4 L 15 4 L 15 7 M 10 11 L 10 16 M 14 11 L 14 16"
+            : name == "trash-all" ? "M 5 7 L 19 7 L 18 20 L 6 20 Z M 9 7 L 9 4 L 15 4 L 15 7 M 3 12 L 21 12 M 3 16 L 21 16"
+            : name == "sliders" ? "M 4 8 L 20 8 M 4 16 L 20 16 M 9 4 L 9 12 M 15 12 L 15 20"
+            : name == "clock" ? "M 12 3 A 9 9 0 0 1 12 21 A 9 9 0 0 1 12 3 Z M 12 7 L 12 12 L 16 14"
+            : name == "play-queue" ? "M 3 6 L 11 6 L 11 8 L 3 8 Z M 3 11 L 11 11 L 11 13 L 3 13 Z M 3 16 L 11 16 L 11 18 L 3 18 Z M 13 4 L 22 11 L 13 18 Z"
+            : name == "stop-queue" ? "M 3 6 L 11 6 L 11 8 L 3 8 Z M 3 11 L 11 11 L 11 13 L 3 13 Z M 3 16 L 11 16 L 11 18 L 3 18 Z M 13 5 L 21 5 L 21 17 L 13 17 Z"
+            : name == "stop-all" ? "M 6 4 L 18 4 L 18 12 L 6 12 Z M 4 16 L 20 16 L 20 19 L 4 19 Z"
+            : name == "grabber" ? "M 12 3 A 9 9 0 0 1 12 21 A 9 9 0 0 1 12 3 Z M 5 5 L 19 19"
+            : name == "upload" ? "M 12 3 L 18 9 L 14 9 L 14 15 L 10 15 L 10 9 L 6 9 Z M 4 17 L 20 17 L 20 21 L 4 21 Z"
+            : name == "downloads" ? "M 11 2 L 13 2 L 13 11 L 17 7 L 19 9 L 12 16 L 5 9 L 7 7 L 11 11 Z M 3 18 L 21 18 L 21 21 L 3 21 Z"
+            : name == "incomplete" ? "M 12 2 A 10 10 0 0 1 12 22 A 10 10 0 0 1 12 2 Z M 12 6 L 12 12 M 8 10 L 12 14 L 16 10"
+            : name == "complete" ? "M 5 13 L 10 18 L 19 7"
+            : name == "documents" ? "M 6 3 L 14 3 L 18 7 L 18 21 L 6 21 Z M 14 3 L 14 7 L 18 7 M 9 12 L 15 12 M 9 16 L 15 16"
+            : name == "music" ? "M 9 16 A 3 3 0 1 1 15 16 A 3 3 0 1 1 9 16 Z M 10 4 L 12 4 L 12 17 L 10 17 Z M 12 4 L 20 5 L 20 7 L 12 6 Z"
+            : name == "programs" ? "M 4 5 L 20 5 L 20 19 L 4 19 Z M 8 9 L 16 9 M 8 13 L 16 13 M 8 17 L 13 17"
+            : name == "video" ? "M 3 6 L 21 6 L 21 18 L 3 18 Z M 10 9 L 16 12 L 10 15 Z"
+            : name == "archive" ? "M 4 5 L 20 5 L 20 10 L 4 10 Z M 6 11 L 18 11 L 18 20 L 6 20 Z"
+            : name == "camera" ? "M 3 7 L 9 7 L 11 4 L 13 4 L 15 7 L 21 7 L 21 19 L 3 19 Z"
+            : name == "file" ? "M 6 3 L 14 3 L 18 7 L 18 21 L 6 21 Z M 14 3 L 14 7 L 18 7"
+            : name == "chevron-right" ? "M 9 5 L 16 12 L 9 19 Z"
+            : name == "chevron-down" ? "M 5 9 L 12 16 L 19 9 Z"
+            : name == "dot" ? "M 12 10 A 2 2 0 1 1 11.99 10 Z"
+            : name == "close" ? "M 6 6 L 18 18 M 18 6 L 6 18"
+            : "M 6 3 L 14 3 L 18 7 L 18 21 L 6 21 Z";
+    }
+
+    width: root.icon_size;
+    height: root.icon_size;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    fill: root.stroked ? transparent : root.icon_color;
+    stroke: root.stroked ? root.icon_color : transparent;
+    stroke-width: 2px;
+    stroke-line-cap: round;
+    stroke-line-join: round;
+    commands: root.glyph(root.icon_name);
+    accessible-role: none;
+}
+
+// -----------------------------------------------------------------------------
+// ToolbarButton — big button: glyph on top, label underneath.
+// -----------------------------------------------------------------------------
+component ToolbarButton inherits Rectangle {
+    in property <string> label: "";
+    in property <string> icon_name: "";
+    in property <string> accessible_name: "";
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    callback clicked;
+
+    forward-focus: i-focus;
+
+    width: 78px;
+    height: 62px;
+    border-radius: 6px;
+    background: !root.enabled ? transparent
+        : root.primary ? Theme.accent
+        : i-hover.has-hover ? Theme.accent_soft
+        : i-focus.has-focus ? Theme.surface_alt
+        : transparent;
+    border-width: root.primary ? 1px : 0px;
+    border-color: Theme.accent;
+
+    accessible-role: button;
+    accessible-label: root.accessible_name != "" ? root.accessible_name : root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if (root.enabled) { root.clicked(); }
+    }
+
+    VerticalLayout {
+        padding-top: 6px;
+        padding-bottom: 4px;
+        spacing: 3px;
+        alignment: center;
+
+        AppIcon {
+            icon_name: root.icon_name;
+            icon_color: !root.enabled ? Theme.disabled : root.primary ? Theme.on_accent : Theme.text_secondary;
+            icon_size: 22px;
+            horizontal-stretch: 0;
+        }
+        Text {
+            text: root.label;
+            color: !root.enabled ? Theme.disabled : root.primary ? Theme.on_accent : Theme.text_secondary;
+            font-size: 11px;
+            horizontal-alignment: center;
+            overflow: elide;
+            max-lines: 1;
+            accessible-role: none;
+        }
+    }
+
+
+    // Visible keyboard focus indicator (WCAG 2.4.7).
+    Rectangle {
+        x: -2px;
+        y: -2px;
+        width: parent.width + 4px;
+        height: parent.height + 4px;
+        border-width: 2px;
+        border-color: Theme.focus_ring;
+        border-radius: 8px;
+        visible: i-focus.has-focus;
+        accessible-role: none;
+    }
+
+    i-focus := FocusScope {
+        focus-on-tab-navigation: true;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                if (root.enabled) { root.clicked(); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    i-hover := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// MenuPopupItem — one row of a drop-down menu.
+// -----------------------------------------------------------------------------
+component MenuPopupItem inherits Rectangle {
+    in property <MenuEntry> entry_data;
+    callback menu-action(string);
+
+    forward-focus: i-focus;
+
+    height: entry_data.separator_before ? 29px : 24px;
+    background: entry_data.enabled && i-hover.has-hover ? Theme.accent_soft : transparent;
+
+    accessible-role: button;
+    accessible-label: root.entry_data.label;
+    accessible-enabled: root.entry_data.enabled;
+    accessible-checkable: root.entry_data.checked;
+    accessible-checked: root.entry_data.checked;
+    accessible-action-default => {
+        if (root.entry_data.enabled) { root.menu-action(root.entry_data.action); }
+    }
+
+    Rectangle {
+        height: 1px;
+        background: Theme.border;
+        visible: root.entry_data.separator_before;
+        y: 0;
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+
+        Rectangle {
+            width: 12px;
+            visible: root.entry_data.checked;
+            AppIcon {
+                icon_name: "complete";
+                icon_color: Theme.accent;
+                icon_size: 12px;
+                stroked: true;
+            }
+        }
+        Text {
+            text: root.entry_data.label;
+            color: root.entry_data.enabled ? Theme.text_primary : Theme.disabled;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+            max-lines: 1;
+            accessible-role: none;
+        }
+    }
+
+
+    // Visible keyboard focus indicator (WCAG 2.4.7).
+    Rectangle {
+        x: -2px;
+        y: -2px;
+        width: parent.width + 4px;
+        height: parent.height + 4px;
+        border-width: 2px;
+        border-color: Theme.focus_ring;
+        border-radius: 8px;
+        visible: i-focus.has-focus;
+        accessible-role: none;
+    }
+
+    i-focus := FocusScope {
+        focus-on-tab-navigation: true;
+        enabled: root.entry_data.enabled;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                if (root.entry_data.enabled) { root.menu-action(root.entry_data.action); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    i-hover := TouchArea {
+        enabled: root.entry_data.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            if (root.entry_data.enabled) { root.menu-action(root.entry_data.action); }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// MenuBarButton — menu entry that opens its own drop-down popup.
+// -----------------------------------------------------------------------------
+component MenuBarButton inherits Rectangle {
+    in property <string> label: "";
+    in property <string> menu_id: "";
+    in property <bool> menu_open: false;
+    callback menu-requested(string, length);
+
+    forward-focus: i-focus;
+
+    width: max(78px, 8px * self.label.character-count + 24px);
+    height: 26px;
+
+    background: root.menu_open ? Theme.accent : i-hover.has-hover ? Theme.accent_soft : transparent;
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-expanded: root.menu_open;
+    accessible-action-default => { root.menu-requested(root.menu_id, self.absolute-position.x); }
+
+    Text {
+        text: root.label;
+        color: root.menu_open ? Theme.on_accent : Theme.text_primary;
+        font-size: 13px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        accessible-role: none;
+    }
+
+
+    // Visible keyboard focus indicator (WCAG 2.4.7).
+    Rectangle {
+        x: -2px;
+        y: -2px;
+        width: parent.width + 4px;
+        height: parent.height + 4px;
+        border-width: 2px;
+        border-color: Theme.focus_ring;
+        border-radius: 8px;
+        visible: i-focus.has-focus;
+        accessible-role: none;
+    }
+
+    i-focus := FocusScope {
+        focus-on-tab-navigation: true;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.menu-requested(root.menu_id, self.absolute-position.x);
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    i-hover := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.menu-requested(root.menu_id, self.absolute-position.x); }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// MenuPopup — the drop-down body shared by the menu bar popups.
+// -----------------------------------------------------------------------------
+component MenuPopup inherits Rectangle {
+    in property <[MenuEntry]> entries: [];
+    callback menu-action(string);
+    callback dismiss();
+
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border_strong;
+    border-radius: 4px;
+    drop-shadow-color: #1b2233aa;
+    drop-shadow-blur: 8px;
+    drop-shadow-offset-y: 2px;
+
+    VerticalLayout {
+        padding: 4px;
+        spacing: 0;
+        for entry in root.entries: MenuPopupItem {
+            entry_data: entry;
+            menu-action(action) => {
+                root.menu-action(action);
+                root.dismiss();
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// CategoryItem — one row of the category tree (expand/collapse + filter).
+// -----------------------------------------------------------------------------
+component CategoryItem inherits Rectangle {
+    in property <CategoryNode> node_data;
+    in property <bool> selected: false;
+    in property <bool> expanded: false;
+    in property <string> count_text: "";
+    callback node-activated(string);
+    callback node-toggled();
+
+    forward-focus: i-focus;
+
+    height: 26px;
+    background: root.selected ? Theme.accent_soft : i-hover.has-hover ? Theme.surface : transparent;
+
+    accessible-role: button;
+    accessible-label: root.node_data.label + (root.node_data.supported ? "" : " (não suportado)");
+    accessible-enabled: root.node_data.supported;
+    accessible-action-default => {
+        if (root.node_data.supported) { root.node-activated(root.node_data.id); }
+    }
+
+    HorizontalLayout {
+        padding-left: 4px + root.node_data.depth * 16px;
+        padding-right: 8px;
+        spacing: 4px;
+
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            visible: root.node_data.expandable;
+            cross-axis-self-alignment: center;
+            AppIcon {
+                icon_name: root.expanded ? "chevron-down" : "chevron-right";
+                icon_color: Theme.text_secondary;
+                icon_size: 12px;
+                horizontal-stretch: 0;
+            }
+        }
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            visible: !root.node_data.expandable;
+            AppIcon {
+                icon_name: "dot";
+                icon_color: Theme.border_strong;
+                icon_size: 10px;
+                horizontal-stretch: 0;
+            }
+        }
+        AppIcon {
+            icon_name: root.node_data.icon_name;
+            icon_color: !root.node_data.supported ? Theme.disabled : root.selected ? Theme.accent : Theme.text_secondary;
+            icon_size: 15px;
+            horizontal-stretch: 0;
+        }
+        Text {
+            text: root.node_data.label;
+            color: !root.node_data.supported ? Theme.disabled : root.selected ? Theme.accent : Theme.text_primary;
+            font-size: 12px;
+            font-weight: root.selected ? 600 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+            max-lines: 1;
+            accessible-role: none;
+        }
+        Text {
+            text: root.count_text;
+            color: Theme.text_muted;
+            font-size: 11px;
+            vertical-alignment: center;
+            visible: root.count_text != "";
+            accessible-role: none;
+        }
+    }
+
+
+    // Visible keyboard focus indicator (WCAG 2.4.7).
+    Rectangle {
+        x: -2px;
+        y: -2px;
+        width: parent.width + 4px;
+        height: parent.height + 4px;
+        border-width: 2px;
+        border-color: Theme.focus_ring;
+        border-radius: 8px;
+        visible: i-focus.has-focus;
+        accessible-role: none;
+    }
+
+    i-focus := FocusScope {
+        focus-on-tab-navigation: true;
+        enabled: root.node_data.supported;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                if (root.node_data.supported) { root.node-activated(root.node_data.id); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    i-hover := TouchArea {
+        enabled: root.node_data.supported;
+        mouse-cursor: pointer;
+        clicked => {
+            // The chevron area toggles the branch, the rest of the row filters.
+            if (root.node_data.expandable && self.mouse-x < 24px) {
+                root.node-toggled();
+            } else if (root.node_data.supported) {
+                root.node-activated(root.node_data.id);
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// DownloadRowItem — one row of the download list.
+// -----------------------------------------------------------------------------
+component DownloadRowItem inherits Rectangle {
+    in property <JobRow> job;
+    in property <bool> selected: false;
+    callback job-activated(string);
+
+    height: 38px;
+    background: root.selected ? Theme.accent_soft : i-hover.has-hover ? Theme.surface_alt : Theme.surface;
+
+    accessible-role: list-item;
+    accessible-label: root.job.name + " — " + root.job.status_text;
+
+    Rectangle {
+        width: 3px;
+        height: parent.height;
+        background: Theme.accent;
+        visible: root.selected;
+    }
+    Rectangle {
+        height: 1px;
+        width: parent.width;
+        background: Theme.border;
+        y: parent.height - 1px;
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+
+        AppIcon {
+            icon_name: root.job.category == "documents" ? "documents"
+                : root.job.category == "music" ? "music"
+                : root.job.category == "programs" ? "programs"
+                : root.job.category == "video" ? "video"
+                : "file";
+            icon_color: Theme.text_secondary;
+            icon_size: 16px;
+            horizontal-stretch: 0;
+        }
+        Text {
+            text: root.job.name;
+            color: Theme.text_primary;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+            max-lines: 1;
+            accessible-role: none;
+        }
+        Text {
+            text: root.job.size_text;
+            color: Theme.text_secondary;
+            font-size: 11px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            width: 76px;
+            accessible-role: none;
+        }
+        Text {
+            text: root.job.status_text;
+            color: root.job.status_kind == "active" ? Theme.accent
+                : root.job.status_kind == "done" ? Theme.success
+                : root.job.status_kind == "error" ? Theme.danger
+                : root.job.status_kind == "paused" ? Theme.warning
+                : Theme.text_secondary;
+            font-size: 11px;
+            vertical-alignment: center;
+            width: 92px;
+            overflow: elide;
+            max-lines: 1;
+            accessible-role: none;
+        }
+        HorizontalLayout {
+            width: 110px;
+            spacing: 6px;
+            ProgressIndicator {
+                progress: root.job.progress < 0 ? 0 : root.job.progress;
+                indeterminate: root.job.progress < 0 && (root.job.status_kind == "active" || root.job.status_kind == "paused" || root.job.status_kind == "queued");
+                cross-axis-self-alignment: center;
+            }
+            Text {
+                text: root.job.progress_text;
+                color: Theme.text_secondary;
+                font-size: 11px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: 34px;
+                accessible-role: none;
+            }
+        }
+        Text {
+            text: root.job.eta_text;
+            color: Theme.text_secondary;
+            font-size: 11px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            width: 62px;
+            accessible-role: none;
+        }
+        Text {
+            text: root.job.speed_text;
+            color: Theme.text_secondary;
+            font-size: 11px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            width: 82px;
+            accessible-role: none;
+        }
+        Text {
+            text: root.job.priority;
+            color: Theme.text_muted;
+            font-size: 11px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            width: 46px;
+            overflow: elide;
+            max-lines: 1;
+            accessible-role: none;
+        }
+    }
+
+    i-hover := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.job-activated(root.job.id); }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SplitterHandle — draggable divider between the tree and the list.
+// -----------------------------------------------------------------------------
+component SplitterHandle inherits Rectangle {
+    callback moved-by(length);
+
+    width: 5px;
+    background: i-hover.has-hover ? Theme.accent : Theme.border;
+
+    i-hover := TouchArea {
+        mouse-cursor: pointer;
+        property <length> last_x: 0px;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                self.last_x = self.mouse-x;
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.moved-by(self.mouse-x - self.last_x);
+                self.last_x = self.mouse-x;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// FieldLabel — form label used inside the dialogs.
+// -----------------------------------------------------------------------------
+component FieldLabel inherits Text {
+    color: Theme.text_secondary;
+    font-size: 12px;
+    vertical-alignment: center;
+    accessible-role: none;
+}
+
+// -----------------------------------------------------------------------------
+// MainWindow
+// -----------------------------------------------------------------------------
 export component MainWindow inherits Window {
     title: "Independent Download Manager";
-    width: 920px;
-    height: 980px;
-    background: #121820;
+    width: 1000px;
+    height: 640px;
+    background: Theme.window_bg;
+    default-font-size: 13px;
 
-    in-out property <string> status: "Ready";
+    // ----- state -------------------------------------------------------------
+    in-out property <string> status: "Pronto.";
     in-out property <[JobRow]> jobs: [];
+    in-out property <[HistoryRow]> history: [];
     in-out property <string> selected_job_id: "";
+    in-out property <string> selected_job_details: "";
+    in-out property <int> selected_index: -1;
+    in-out property <bool> selected_job_can_pause: false;
+    in-out property <bool> selected_job_can_resume: false;
+    in-out property <bool> selected_job_can_cancel: false;
     in-out property <bool> selected_job_can_set_priority: false;
+    in-out property <string> selected_category: "all";
+    in-out property <bool> tree_expanded: true;
+    in-out property <length> tree_width: 214px;
+    in-out property <string> in_app_notification: "";
+    in-out property <string> progress_announcement: "";
+    in-out property <bool> has_pending_cleanup: false;
+    in-out property <bool> cleanup_retry_in_progress: false;
+    in-out property <string> downloads_dir: "";
+
+    // ----- counters (pre-rendered text: Slint has no number-to-string cast) --
+    in-out property <string> count_all_text: "";
+    in-out property <string> count_incomplete_text: "";
+    in-out property <string> count_complete_text: "";
+    in-out property <string> count_tasks_text: "";
+    in-out property <string> count_documents_text: "";
+    in-out property <string> count_music_text: "";
+    in-out property <string> count_programs_text: "";
+    in-out property <string> count_video_text: "";
+    in-out property <string> active_count_text: "0";
+    in-out property <string> queued_count_text: "0";
+    in-out property <string> completed_count_text: "0";
+    in-out property <string> global_speed_text: "0 B/s";
+    in-out property <bool> can_pause_all: false;
+    in-out property <bool> can_resume_all: false;
+    in-out property <bool> can_cancel_all: false;
+
+    // ----- settings echo -----------------------------------------------------
     in-out property <string> max_active: "3";
     in-out property <string> speed_limit: "0";
     in-out property <string> global_bandwidth_limit: "0";
     in-out property <string> max_download_mib: "4096";
     in-out property <string> max_duration_minutes: "360";
     in-out property <string> max_segments: "1";
-    in-out property <[HistoryRow]> history: [];
-    in-out property <string> in_app_notification: "";
-    in-out property <string> progress_announcement: "";
-    in-out property <bool> has_pending_cleanup: false;
-    in-out property <bool> cleanup_retry_in_progress: false;
-    callback add_url(string, string, bool, string, string);
+
+    // ----- dialogs -----------------------------------------------------------
+    in-out property <bool> add_dialog_open: false;
+    in-out property <string> add_dialog_error: "";
+    in-out property <bool> options_dialog_open: false;
+    in-out property <bool> history_dialog_open: false;
+    in-out property <bool> about_dialog_open: false;
+    in-out property <bool> schedule_focus: false;
+    in-out property <string> open_menu_id: "";
+    in-out property <bool> tasks_menu_open;
+    in-out property <bool> file_menu_open;
+    in-out property <bool> downloads_menu_open;
+    in-out property <bool> view_menu_open;
+    in-out property <bool> help_menu_open;
+    in-out property <bool> registry_menu_open;
+
+    // ----- callbacks ---------------------------------------------------------
+    callback add_url(string, string, string, string, string, bool, string, string);
     callback job_action(string, string);
     callback set_job_priority(string, string);
     callback save_limits(string, string, string, string, string, string);
     callback retry_pending_cleanup();
     callback clear_history();
     callback dismiss_notification();
+    callback select_category(string);
+    callback select_job(string);
+    callback move_selection(int);
+    callback bulk_action(string);
+    callback quit_app();
 
+    // ----- static models -----------------------------------------------------
+    in property <[CategoryNode]> categories: [
+        { id: "all", label: "Todos os downloads", icon_name: "downloads", depth: 0, expandable: true, supported: true },
+        { id: "incomplete", label: "Incompletos", icon_name: "incomplete", depth: 1, expandable: false, supported: true },
+        { id: "complete", label: "Completos", icon_name: "complete", depth: 1, expandable: false, supported: true },
+        { id: "tasks", label: "Tarefas", icon_name: "clock", depth: 1, expandable: false, supported: true },
+        { id: "documents", label: "Documentos", icon_name: "documents", depth: 1, expandable: false, supported: true },
+        { id: "music", label: "Música", icon_name: "music", depth: 1, expandable: false, supported: true },
+        { id: "programs", label: "Programas", icon_name: "programs", depth: 1, expandable: false, supported: true },
+        { id: "video", label: "Vídeo", icon_name: "video", depth: 1, expandable: false, supported: true },
+        { id: "archives", label: "Compactados", icon_name: "archive", depth: 1, expandable: false, supported: false },
+        { id: "grabber", label: "Projetos Grabber", icon_name: "camera", depth: 1, expandable: false, supported: false },
+    ];
+
+    in property <[MenuEntry]> tasks_menu: [
+        { entry_id: "tasks-add", label: "Adicionar download…", action: "add", enabled: true, separator_before: false, checked: false },
+        { entry_id: "tasks-schedule", label: "Agendar download…", action: "schedule", enabled: true, separator_before: false, checked: false },
+        { entry_id: "tasks-start-queue", label: "Iniciar fila", action: "start-queue", enabled: true, separator_before: true, checked: false },
+        { entry_id: "tasks-stop-queue", label: "Parar fila", action: "stop-queue", enabled: true, separator_before: false, checked: false },
+        { entry_id: "tasks-clear-history", label: "Limpar histórico", action: "clear-history", enabled: true, separator_before: true, checked: false },
+    ];
+
+    in property <[MenuEntry]> file_menu: [
+        { entry_id: "file-add", label: "Adicionar download…", action: "add", enabled: true, separator_before: false, checked: false },
+        { entry_id: "file-options", label: "Opções…", action: "options", enabled: true, separator_before: true, checked: false },
+        { entry_id: "file-exit", label: "Sair", action: "exit", enabled: true, separator_before: true, checked: false },
+    ];
+
+    in property <[MenuEntry]> downloads_menu: [
+        { entry_id: "dl-start", label: "Iniciar", action: "start", enabled: root.selected_job_can_resume, separator_before: false, checked: false },
+        { entry_id: "dl-stop", label: "Parar", action: "stop", enabled: root.selected_job_can_pause, separator_before: false, checked: false },
+        { entry_id: "dl-delete", label: "Excluir", action: "delete", enabled: root.selected_job_can_cancel, separator_before: false, checked: false },
+        { entry_id: "dl-delete-all", label: "Excluir todos", action: "delete-all", enabled: root.can_cancel_all, separator_before: false, checked: false },
+        { entry_id: "dl-prio-high", label: "Prioridade alta", action: "priority-high", enabled: root.selected_job_can_set_priority, separator_before: true, checked: false },
+        { entry_id: "dl-prio-normal", label: "Prioridade normal", action: "priority-normal", enabled: root.selected_job_can_set_priority, separator_before: false, checked: false },
+        { entry_id: "dl-prio-low", label: "Prioridade baixa", action: "priority-low", enabled: root.selected_job_can_set_priority, separator_before: false, checked: false },
+    ];
+
+    in property <[MenuEntry]> view_menu: [
+        { entry_id: "view-expand", label: "Expandir categorias", action: "expand-tree", enabled: true, separator_before: false, checked: false },
+        { entry_id: "view-collapse", label: "Recolher categorias", action: "collapse-tree", enabled: true, separator_before: false, checked: false },
+        { entry_id: "view-incomplete", label: "Ver incompletos", action: "show-incomplete", enabled: true, separator_before: true, checked: false },
+        { entry_id: "view-complete", label: "Ver completos", action: "show-complete", enabled: true, separator_before: false, checked: false },
+        { entry_id: "view-history", label: "Histórico…", action: "history", enabled: true, separator_before: true, checked: false },
+    ];
+
+    in property <[MenuEntry]> help_menu: [
+        { entry_id: "help-about", label: "Sobre o aplicativo", action: "about", enabled: true, separator_before: false, checked: false },
+    ];
+
+    in property <[MenuEntry]> registry_menu: [
+        { entry_id: "reg-none", label: "Registro do produto (não suportado)", action: "none", enabled: false, separator_before: false, checked: false },
+    ];
+
+    // ----- helpers -----------------------------------------------------------
+    pure function category-count(id: string) -> string {
+        return id == "all" ? root.count_all_text
+            : id == "incomplete" ? root.count_incomplete_text
+            : id == "complete" ? root.count_complete_text
+            : id == "tasks" ? root.count_tasks_text
+            : id == "documents" ? root.count_documents_text
+            : id == "music" ? root.count_music_text
+            : id == "programs" ? root.count_programs_text
+            : id == "video" ? root.count_video_text
+            : "";
+    }
+
+    public function open-menu(id: string, x: length) {
+        root.open_menu_id = id;
+        if (id == "tasks") {
+            tasks-popup.show();
+        } else if (id == "file") {
+            file-popup.show();
+        } else if (id == "downloads") {
+            downloads-popup.show();
+        } else if (id == "view") {
+            view-popup.show();
+        } else if (id == "help") {
+            help-popup.show();
+        } else if (id == "registry") {
+            registry-popup.show();
+        }
+    }
+
+    public function open-add-dialog(with_schedule: bool) {
+        root.add_dialog_error = "";
+        root.schedule_focus = with_schedule;
+        root.add_dialog_open = true;
+        add-popup.show();
+    }
+
+    public function handle-menu-action(action: string) {
+        if (action == "add") {
+            root.open-add-dialog(false);
+        } else if (action == "schedule") {
+            root.open-add-dialog(true);
+        } else if (action == "options") {
+            root.options_dialog_open = true;
+            options-popup.show();
+        } else if (action == "history") {
+            root.history_dialog_open = true;
+            history-popup.show();
+        } else if (action == "about") {
+            root.about_dialog_open = true;
+            about-popup.show();
+        } else if (action == "start") {
+            root.job_action(root.selected_job_id, "resume");
+        } else if (action == "stop") {
+            root.job_action(root.selected_job_id, "pause");
+        } else if (action == "delete") {
+            root.job_action(root.selected_job_id, "cancel");
+        } else if (action == "start-queue") {
+            root.bulk_action("resume-all");
+        } else if (action == "stop-queue") {
+            root.bulk_action("pause-all");
+        } else if (action == "delete-all") {
+            root.bulk_action("cancel-all");
+        } else if (action == "priority-high") {
+            root.set_job_priority(root.selected_job_id, "High");
+        } else if (action == "priority-normal") {
+            root.set_job_priority(root.selected_job_id, "Normal");
+        } else if (action == "priority-low") {
+            root.set_job_priority(root.selected_job_id, "Low");
+        } else if (action == "clear-history") {
+            root.clear_history();
+        } else if (action == "expand-tree") {
+            root.tree_expanded = true;
+        } else if (action == "collapse-tree") {
+            root.tree_expanded = false;
+        } else if (action == "show-incomplete") {
+            root.select_category("incomplete");
+        } else if (action == "show-complete") {
+            root.select_category("complete");
+        } else if (action == "exit") {
+            root.quit_app();
+        }
+    }
+
+    changed add_dialog_open => {
+        if (!root.add_dialog_open) { add-popup.close(); }
+    }
+    changed options_dialog_open => {
+        if (!root.options_dialog_open) { options-popup.close(); }
+    }
+    changed history_dialog_open => {
+        if (!root.history_dialog_open) { history-popup.close(); }
+    }
+    changed about_dialog_open => {
+        if (!root.about_dialog_open) { about-popup.close(); }
+    }
+
+    // ----- layout ------------------------------------------------------------
     VerticalLayout {
-        padding: 28px;
-        spacing: 18px;
+        spacing: 0;
 
-        Text {
-            text: "Downloads";
-            color: #f4f7fb;
-            font-size: 30px;
-            font-weight: 700;
-        }
-        Text {
-            text: "Independent HTTP(S) transfers — URLs are used only after you add them.";
-            color: #aab7c5;
-            font-size: 14px;
-        }
-        Text {
-            text: "Manual URL (Ctrl+V to paste explicitly)";
-            color: #c4cfda;
-            font-size: 13px;
-        }
+        // ============ menu bar ============
+        Rectangle {
+            height: 28px;
+            background: Theme.surface;
+            border-width: 0px;
+            border-color: Theme.border;
 
-        HorizontalLayout {
-            spacing: 10px;
-            url_entry := LineEdit {
-                placeholder-text: "https://example.org/file.zip";
-                accessible-label: "Manual URL; Ctrl+V to paste explicitly";
-                min-height: 44px;
-                horizontal-stretch: 1;
+            HorizontalLayout {
+                padding-left: 6px;
+                spacing: 2px;
+
+                menu_tasks := MenuBarButton {
+                    label: "Tarefas";
+                    menu_id: "tasks";
+                    menu_open: root.tasks_menu_open;
+                    menu-requested(id, x) => { root.open-menu(id, x); }
+                }
+                menu_file := MenuBarButton {
+                    label: "Arquivo";
+                    menu_id: "file";
+                    menu_open: root.file_menu_open;
+                    menu-requested(id, x) => { root.open-menu(id, x); }
+                }
+                menu_downloads := MenuBarButton {
+                    label: "Downloads";
+                    menu_id: "downloads";
+                    menu_open: root.downloads_menu_open;
+                    menu-requested(id, x) => { root.open-menu(id, x); }
+                }
+                menu_view := MenuBarButton {
+                    label: "Visualizar";
+                    menu_id: "view";
+                    menu_open: root.view_menu_open;
+                    menu-requested(id, x) => { root.open-menu(id, x); }
+                }
+                menu_help := MenuBarButton {
+                    label: "Ajuda";
+                    menu_id: "help";
+                    menu_open: root.help_menu_open;
+                    menu-requested(id, x) => { root.open-menu(id, x); }
+                }
+                menu_registry := MenuBarButton {
+                    label: "Registro";
+                    menu_id: "registry";
+                    menu_open: root.registry_menu_open;
+                    menu-requested(id, x) => { root.open-menu(id, x); }
+                }
             }
-            Button {
-                text: "Add download";
-                clicked => {
-                    root.add_url(
-                        url_entry.text,
-                        expected_hash_entry.text,
-                        schedule_toggle.checked,
-                        schedule_start_entry.text,
-                        schedule_end_entry.text
-                    );
+
+            Rectangle {
+                height: 1px;
+                width: parent.width;
+                y: parent.height - 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ============ toolbar ============
+        Rectangle {
+            height: 74px;
+            background: Theme.surface_alt;
+
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                padding-top: 4px;
+                padding-bottom: 4px;
+                spacing: 2px;
+
+                ToolbarButton {
+                    label: "Adicionar";
+                    icon_name: "plus";
+                    accessible_name: "Adicionar download";
+                    primary: true;
+                    clicked => { root.open-add-dialog(false); }
+                }
+                ToolbarButton {
+                    label: "Iniciar";
+                    icon_name: "play";
+                    accessible_name: "Iniciar download selecionado";
+                    enabled: root.selected_job_can_resume;
+                    clicked => { root.job_action(root.selected_job_id, "resume"); }
+                }
+                ToolbarButton {
+                    label: "Parar";
+                    icon_name: "stop";
+                    accessible_name: "Parar (pausar) download selecionado";
+                    enabled: root.selected_job_can_pause;
+                    clicked => { root.job_action(root.selected_job_id, "pause"); }
+                }
+                ToolbarButton {
+                    label: "Parar (todos)";
+                    icon_name: "stop-all";
+                    accessible_name: "Parar todos os downloads";
+                    enabled: root.can_pause_all;
+                    clicked => { root.bulk_action("pause-all"); }
+                }
+                ToolbarButton {
+                    label: "Excluir";
+                    icon_name: "trash";
+                    accessible_name: "Excluir download selecionado";
+                    enabled: root.selected_job_can_cancel;
+                    clicked => { root.job_action(root.selected_job_id, "cancel"); }
+                }
+                ToolbarButton {
+                    label: "Excluir (todos)";
+                    icon_name: "trash-all";
+                    accessible_name: "Excluir todos os downloads";
+                    enabled: root.can_cancel_all;
+                    clicked => { root.bulk_action("cancel-all"); }
+                }
+                ToolbarButton {
+                    label: "Opções";
+                    icon_name: "sliders";
+                    accessible_name: "Abrir opções de transferência";
+                    clicked => {
+                        root.options_dialog_open = true;
+                        options-popup.show();
+                    }
+                }
+                ToolbarButton {
+                    label: "Agendar";
+                    icon_name: "clock";
+                    accessible_name: "Agendar download (janela UTC)";
+                    clicked => { root.open-add-dialog(true); }
+                }
+                ToolbarButton {
+                    label: "Iniciar fila";
+                    icon_name: "play-queue";
+                    accessible_name: "Iniciar fila de downloads pausados";
+                    enabled: root.can_resume_all;
+                    clicked => { root.bulk_action("resume-all"); }
+                }
+                ToolbarButton {
+                    label: "Parar fila";
+                    icon_name: "stop-queue";
+                    accessible_name: "Parar a fila de downloads";
+                    enabled: root.can_pause_all;
+                    clicked => { root.bulk_action("pause-all"); }
+                }
+                ToolbarButton {
+                    label: "Grabber";
+                    icon_name: "grabber";
+                    accessible_name: "Grabber — não suportado nesta versão";
+                    enabled: false;
+                }
+                ToolbarButton {
+                    label: "Indique";
+                    icon_name: "upload";
+                    accessible_name: "Indique o aplicativo — não suportado nesta versão";
+                    enabled: false;
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                width: parent.width;
+                y: parent.height - 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ============ notification strip ============
+        Rectangle {
+            height: root.in_app_notification != "" ? 44px : 0px;
+            visible: root.in_app_notification != "";
+            background: Theme.accent_soft;
+            border-width: 0px;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 6px;
+                spacing: 8px;
+
+                Text {
+                    text: root.in_app_notification;
+                    color: Theme.text_primary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    max-lines: 2;
+                    overflow: elide;
+                    wrap: word-wrap;
+                    accessible-role: text;
+                    accessible-label: root.in_app_notification;
+                    accessible-live-region: polite;
+                }
+                Button {
+                    text: "Dispensar";
+                    clicked => { root.dismiss_notification(); }
                 }
             }
         }
+
+        // ============ body ============
         HorizontalLayout {
-            spacing: 10px;
-            Text { text: "Expected staging SHA-256 (optional)"; color: #c4cfda; vertical-alignment: center; }
-            expected_hash_entry := LineEdit {
-                placeholder-text: "64 hex characters, no spaces; blank disables verification";
+            spacing: 0;
+
+            // ---- category tree ----
+            Rectangle {
+                width: root.tree_width;
+                background: Theme.surface_sunken;
+
+                VerticalLayout {
+                    spacing: 0;
+
+                    Rectangle {
+                        height: 28px;
+                        background: Theme.surface_sunken;
+                        border-width: 0px;
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            Text {
+                                text: "Categorias";
+                                color: Theme.text_secondary;
+                                font-size: 11px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                accessible-role: none;
+                            }
+                        }
+                    }
+
+                    ScrollView {
+                        VerticalLayout {
+                            padding-top: 2px;
+                            padding-bottom: 2px;
+                            spacing: 0;
+
+                            for node in root.categories: CategoryItem {
+                                node_data: node;
+                                visible: node.depth == 0 || root.tree_expanded;
+                                selected: root.selected_category == node.id;
+                                expanded: root.tree_expanded;
+                                count_text: root.category-count(node.id);
+                                node-activated(id) => { root.select_category(id); }
+                                node-toggled => { root.tree_expanded = !root.tree_expanded; }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 1px;
+                    height: parent.height;
+                    background: Theme.border;
+                    x: parent.width - 1px;
+                }
+            }
+
+            // ---- splitter ----
+            SplitterHandle {
+                moved-by(delta) => {
+                    root.tree_width = max(160px, min(340px, root.tree_width + delta));
+                }
+            }
+
+            // ---- download list ----
+            Rectangle {
                 horizontal-stretch: 1;
+                background: Theme.surface;
+
+                VerticalLayout {
+                    spacing: 0;
+
+                    // column header
+                    Rectangle {
+                        height: 28px;
+                        background: Theme.surface;
+
+                        HorizontalLayout {
+                            padding-left: 32px;
+                            padding-right: 8px;
+                            spacing: 8px;
+
+                            Text { text: "Nome"; color: Theme.text_secondary; font-size: 11px; font-weight: 600; horizontal-stretch: 1; vertical-alignment: center; accessible-role: none; }
+                            Text { text: "Tamanho"; color: Theme.text_secondary; font-size: 11px; font-weight: 600; width: 76px; horizontal-alignment: right; vertical-alignment: center; accessible-role: none; }
+                            Text { text: "Status"; color: Theme.text_secondary; font-size: 11px; font-weight: 600; width: 92px; vertical-alignment: center; accessible-role: none; }
+                            Text { text: "Progresso"; color: Theme.text_secondary; font-size: 11px; font-weight: 600; width: 110px; vertical-alignment: center; accessible-role: none; }
+                            Text { text: "ETA"; color: Theme.text_secondary; font-size: 11px; font-weight: 600; width: 62px; horizontal-alignment: right; vertical-alignment: center; accessible-role: none; }
+                            Text { text: "Velocidade"; color: Theme.text_secondary; font-size: 11px; font-weight: 600; width: 82px; horizontal-alignment: right; vertical-alignment: center; accessible-role: none; }
+                            Text { text: "Prio."; color: Theme.text_secondary; font-size: 11px; font-weight: 600; width: 46px; horizontal-alignment: right; vertical-alignment: center; accessible-role: none; }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            width: parent.width;
+                            background: Theme.border_strong;
+                            y: parent.height - 1px;
+                        }
+                    }
+
+                    // rows
+                    FocusScope {
+                        focus-on-tab-navigation: true;
+                        accessible-role: list;
+                        accessible-label: "Lista de downloads";
+                        key-pressed(event) => {
+                            if (event.text == Key.DownArrow) {
+                                root.move_selection(root.selected_index + 1);
+                                return accept;
+                            }
+                            if (event.text == Key.UpArrow) {
+                                root.move_selection(root.selected_index - 1);
+                                return accept;
+                            }
+                            if (event.text == Key.Return || event.text == Key.Space) {
+                                if (root.selected_job_can_resume) {
+                                    root.job_action(root.selected_job_id, "resume");
+                                } else if (root.selected_job_can_pause) {
+                                    root.job_action(root.selected_job_id, "pause");
+                                }
+                                return accept;
+                            }
+                            return reject;
+                        }
+
+                        ListView {
+                            width: 100%;
+                            height: 100%;
+                            for job in root.jobs: DownloadRowItem {
+                                job: job;
+                                selected: job.id == root.selected_job_id;
+                                job-activated(id) => {
+                                    root.selected_job_id = id;
+                                    root.select_job(id);
+                                }
+                            }
+                        }
+                    }
+
+                    // empty state
+                    Rectangle {
+                        height: root.jobs.length == 0 ? 120px : 0px;
+                        visible: root.jobs.length == 0;
+                        background: Theme.surface;
+
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 6px;
+                            Text {
+                                text: root.selected_category == "all" ? "Nenhum download na fila." : "Nenhum download nesta categoria.";
+                                color: Theme.text_muted;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                accessible-role: none;
+                            }
+                            Text {
+                                text: "Use Adicionar ou Ctrl+V na barra de endereço do navegador para incluir uma URL.";
+                                color: Theme.text_muted;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                                accessible-role: none;
+                            }
+                        }
+                    }
+                }
             }
         }
-        HorizontalLayout {
-            spacing: 10px;
-            schedule_toggle := CheckBox { text: "Schedule in UTC"; checked: false; }
-            Text { text: "Window (24-hour HH:MM):"; color: #c4cfda; vertical-alignment: center; }
-            schedule_start_entry := LineEdit { text: "09:00"; width: 90px; }
-            Text { text: "to"; color: #c4cfda; vertical-alignment: center; }
-            schedule_end_entry := LineEdit { text: "17:00"; width: 90px; }
-            Text { text: "UTC"; color: #c4cfda; vertical-alignment: center; }
+
+        // ============ status bar ============
+        Rectangle {
+            height: 26px;
+            background: Theme.surface;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 14px;
+
+                Text { text: "Ativos: " + root.active_count_text; color: Theme.text_secondary; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+                Text { text: "Na fila: " + root.queued_count_text; color: Theme.text_secondary; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+                Text { text: "Completos: " + root.completed_count_text; color: Theme.text_secondary; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+                Text { text: "Velocidade: " + root.global_speed_text; color: Theme.text_secondary; font-size: 11px; vertical-alignment: center; accessible-role: none; }
+                Rectangle { width: 1px; height: 14px; background: Theme.border; }
+                Text {
+                    text: root.selected_job_details != "" ? root.selected_job_details : "Nenhum item selecionado.";
+                    color: Theme.text_secondary;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                    max-lines: 1;
+                    accessible-role: text;
+                    accessible-label: root.selected_job_details;
+                }
+                Text {
+                    text: root.progress_announcement != "" ? root.progress_announcement : root.status;
+                    color: Theme.text_secondary;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    width: 260px;
+                    horizontal-alignment: right;
+                    overflow: elide;
+                    max-lines: 1;
+                    accessible-role: text;
+                    accessible-label: root.progress_announcement != "" ? root.progress_announcement : root.status;
+                    accessible-live-region: polite;
+                }
+                Button {
+                    text: root.cleanup_retry_in_progress ? "Limpando…" : "Repetir limpeza";
+                    enabled: root.has_pending_cleanup && !root.cleanup_retry_in_progress;
+                    clicked => { root.retry_pending_cleanup(); }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                width: parent.width;
+                background: Theme.border;
+            }
         }
-        Text {
-            text: "Clipboard is accessed only on your Ctrl+V gesture; it is never monitored.";
-            color: #8996a4;
-            font-size: 12px;
+    }
+
+    // =========================================================================
+    // Popups: drop-down menus (one per menu bar entry)
+    // =========================================================================
+    tasks-popup := PopupWindow {
+        x: menu_tasks.absolute-position.x;
+        y: 28px;
+        width: 236px;
+        height: 24px * root.tasks_menu.length + 8px;
+        close-policy: close-on-click-outside;
+        MenuPopup {
+            entries: root.tasks_menu;
+            menu-action(action) => { root.handle-menu-action(action); }
+            dismiss => { tasks-popup.close(); }
         }
-        Text {
-            text: "Equal start/end times mean all day; overnight windows are supported.";
-            color: #8996a4;
-            font-size: 12px;
+    }
+
+    file-popup := PopupWindow {
+        x: menu_file.absolute-position.x;
+        y: 28px;
+        width: 236px;
+        height: 24px * root.file_menu.length + 8px;
+        close-policy: close-on-click-outside;
+        MenuPopup {
+            entries: root.file_menu;
+            menu-action(action) => { root.handle-menu-action(action); }
+            dismiss => { file-popup.close(); }
         }
+    }
+
+    downloads-popup := PopupWindow {
+        x: menu_downloads.absolute-position.x;
+        y: 28px;
+        width: 236px;
+        height: 24px * root.downloads_menu.length + 8px;
+        close-policy: close-on-click-outside;
+        MenuPopup {
+            entries: root.downloads_menu;
+            menu-action(action) => { root.handle-menu-action(action); }
+            dismiss => { downloads-popup.close(); }
+        }
+    }
+
+    view-popup := PopupWindow {
+        x: menu_view.absolute-position.x;
+        y: 28px;
+        width: 236px;
+        height: 24px * root.view_menu.length + 8px;
+        close-policy: close-on-click-outside;
+        MenuPopup {
+            entries: root.view_menu;
+            menu-action(action) => { root.handle-menu-action(action); }
+            dismiss => { view-popup.close(); }
+        }
+    }
+
+    help-popup := PopupWindow {
+        x: menu_help.absolute-position.x;
+        y: 28px;
+        width: 236px;
+        height: 24px * root.help_menu.length + 8px;
+        close-policy: close-on-click-outside;
+        MenuPopup {
+            entries: root.help_menu;
+            menu-action(action) => { root.handle-menu-action(action); }
+            dismiss => { help-popup.close(); }
+        }
+    }
+
+    registry-popup := PopupWindow {
+        x: menu_registry.absolute-position.x;
+        y: 28px;
+        width: 236px;
+        height: 24px * root.registry_menu.length + 8px;
+        close-policy: close-on-click-outside;
+        MenuPopup {
+            entries: root.registry_menu;
+            menu-action(action) => { root.handle-menu-action(action); }
+            dismiss => { registry-popup.close(); }
+        }
+    }
+
+    // The menu bar entry stays highlighted while its drop-down is open.
+    tasks_menu_open: tasks-popup.is-open;
+    file_menu_open: file-popup.is-open;
+    downloads_menu_open: downloads-popup.is-open;
+    view_menu_open: view-popup.is-open;
+    help_menu_open: help-popup.is-open;
+    registry_menu_open: registry-popup.is-open;
+
+    // =========================================================================
+    // Popup: add download
+    // =========================================================================
+    add-popup := PopupWindow {
+        x: (root.width - 560px) / 2;
+        y: (root.height - 520px) / 2;
+        width: 560px;
+        height: 520px;
+        close-policy: no-auto-close;
 
         Rectangle {
-            background: #1d2733;
-            border-radius: 12px;
-            VerticalLayout {
-                padding: 16px;
-                spacing: 10px;
-                Text { text: "Transfer limits"; color: #f4f7fb; font-size: 17px; font-weight: 600; }
-                VerticalLayout {
-                    spacing: 8px;
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text { text: "Concurrent downloads per instance (1–8; restart to apply)"; color: #c4cfda; vertical-alignment: center; }
-                        active_entry := LineEdit { text: root.max_active; input-type: number; width: 70px; }
-                        Text { text: "Maximum segments (1–4; default 1)"; color: #c4cfda; vertical-alignment: center; }
-                        max_segments_entry := LineEdit { text: root.max_segments; input-type: number; width: 60px; }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text { text: "Per-download speed cap (KB/s; 0 = unlimited)"; color: #c4cfda; vertical-alignment: center; }
-                        speed_entry := LineEdit { text: root.speed_limit; input-type: number; width: 90px; }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text { text: "Average application-level byte pacing per instance (bytes/s; 0 = unlimited)"; color: #c4cfda; vertical-alignment: center; }
-                        global_bandwidth_entry := LineEdit { text: root.global_bandwidth_limit; input-type: number; width: 120px; }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        Text { text: "Max size per download (MiB)"; color: #c4cfda; vertical-alignment: center; }
-                        max_size_entry := LineEdit { text: root.max_download_mib; input-type: number; width: 100px; }
-                        Text { text: "Absolute duration (minutes)"; color: #c4cfda; vertical-alignment: center; }
-                        max_duration_entry := LineEdit { text: root.max_duration_minutes; input-type: number; width: 80px; }
-                        Button {
-                            text: "Save";
-                            clicked => { root.save_limits(active_entry.text, speed_entry.text, global_bandwidth_entry.text, max_size_entry.text, max_duration_entry.text, max_segments_entry.text); }
-                        }
-                    }
-                }
-                Text {
-                    text: "Application-level average pacing, not an instantaneous wire cap. Each active HTTP stream may hold one 16 KiB reservation; the instance-wide connection quota bounds aggregate reservations. The shared bucket may hold another 16 KiB, and each stream may retain one transport-sized chunk. Client/OS buffering is outside this bound; instances are not coordinated.";
-                    color: #8996a4;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-                Text {
-                    text: "Segments are attempted only for files at least 8 MiB after a strict Range/Content-Length/strong-ETag probe. Every connection consumes one slot from the instance-wide concurrent-download quota; unsupported or inconsistent range responses are cleaned and retried as one stream.";
-                    color: #8996a4;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-            }
-        }
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border_strong;
+            border-radius: 6px;
+            drop-shadow-color: #1b223399;
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 3px;
 
-        HorizontalLayout {
-            spacing: 8px;
-            Text {
-                text: root.in_app_notification;
-                visible: root.in_app_notification != "";
-                color: #f0c674;
-                font-size: 14px;
-                wrap: word-wrap;
-                horizontal-stretch: 1;
-                accessible-role: text;
-                accessible-label: root.in_app_notification;
-                accessible-live-region: polite;
-            }
-            Button {
-                text: "Dismiss notification";
-                visible: root.in_app_notification != "";
-                clicked => { root.dismiss_notification(); }
-            }
-        }
-        Text { text: root.status; color: #70d6c1; font-size: 14px; }
-        Text {
-            text: root.progress_announcement;
-            visible: root.progress_announcement != "";
-            color: #aab7c5;
-            font-size: 12px;
-            wrap: word-wrap;
-            accessible-role: text;
-            accessible-label: root.progress_announcement;
-            accessible-live-region: polite;
-        }
-        Text { text: "Queue"; color: #f4f7fb; font-size: 20px; font-weight: 600; }
-        HorizontalLayout {
-            spacing: 8px;
-            Text {
-                text: "Priority for selected job";
-                color: #c4cfda;
-                vertical-alignment: center;
-            }
-            Button {
-                text: "High";
-                enabled: root.selected_job_id != "" && root.selected_job_can_set_priority;
-                clicked => { root.set_job_priority(root.selected_job_id, "High"); }
-            }
-            Button {
-                text: "Normal";
-                enabled: root.selected_job_id != "" && root.selected_job_can_set_priority;
-                clicked => { root.set_job_priority(root.selected_job_id, "Normal"); }
-            }
-            Button {
-                text: "Low";
-                enabled: root.selected_job_id != "" && root.selected_job_can_set_priority;
-                clicked => { root.set_job_priority(root.selected_job_id, "Low"); }
-            }
-        }
-        Text {
-            text: "Higher priority runs first among permit waiters; equal priorities are FIFO. Active downloads are not interrupted. Sustained High traffic can defer Low jobs.";
-            color: #8996a4;
-            font-size: 12px;
-            wrap: word-wrap;
-        }
-        Button {
-            text: root.cleanup_retry_in_progress ? "Retrying cleanup…" : "Retry pending cleanup";
-            enabled: root.has_pending_cleanup && !root.cleanup_retry_in_progress;
-            clicked => { root.retry_pending_cleanup(); }
-        }
-        ScrollView {
             VerticalLayout {
-                spacing: 7px;
-                for item in root.jobs: Rectangle {
-                    background: #1d2733;
-                    border-radius: 8px;
-                    min-height: 54px;
+                spacing: 0;
+
+                // dialog header
+                Rectangle {
+                    height: 40px;
+                    background: Theme.surface_alt;
+
                     HorizontalLayout {
-                        padding: 8px;
-                        spacing: 7px;
+                        padding-left: 14px;
+                        padding-right: 8px;
+                        spacing: 8px;
+
                         Text {
-                            text: item.details + " · Priority " + item.priority;
-                            accessible-role: text;
-                            accessible-label: item.details + " · Priority " + item.priority;
-                            color: #d3dce5;
-                            font-size: 13px;
-                            wrap: word-wrap;
+                            text: "Adicionar download";
+                            color: Theme.text_primary;
+                            font-size: 15px;
+                            font-weight: 600;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
+                            accessible-role: text;
+                            accessible-label: "Adicionar download";
                         }
                         Button {
-                            text: root.selected_job_id == item.id ? "Selected" : "Select";
+                            text: "Fechar";
                             clicked => {
-                                root.selected_job_id = item.id;
-                                root.selected_job_can_set_priority = item.can_set_priority;
+                                root.add_dialog_open = false;
+                                add-popup.close();
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 1px; background: Theme.border; }
+
+                // form
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 10px;
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        FieldLabel { text: "URL (http ou https)"; }
+                        url_entry := LineEdit {
+                            placeholder-text: "https://exemplo.org/arquivo.zip";
+                            accessible-label: "URL do download";
+                            font-size: 13px;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        FieldLabel { text: "Destino"; }
+                        Rectangle {
+                            height: 34px;
+                            background: Theme.surface_sunken;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            border-radius: 4px;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                Text {
+                                    text: root.downloads_dir;
+                                    color: Theme.text_secondary;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    max-lines: 1;
+                                    accessible-role: text;
+                                    accessible-label: "Pasta de destino: " + root.downloads_dir;
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            horizontal-stretch: 1;
+                            FieldLabel { text: "Prioridade"; }
+                            priority_box := ComboBox {
+                                model: ["Baixa", "Normal", "Alta"];
+                                current-index: 1;
+                                accessible-label: "Prioridade do download";
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            width: 130px;
+                            FieldLabel { text: "Segmentos (1-4)"; }
+                            segments_box := ComboBox {
+                                model: ["1", "2", "3", "4"];
+                                current-index: 0;
+                                accessible-label: "Número de segmentos";
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            width: 150px;
+                            FieldLabel { text: "Velocidade (KB/s, 0=∞)"; }
+                            speed_entry := LineEdit {
+                                placeholder-text: "0";
+                                input-type: number;
+                                accessible-label: "Limite de velocidade em quilobytes por segundo";
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        FieldLabel { text: "SHA-256 esperado (opcional, 64 caracteres hex)"; }
+                        hash_entry := LineEdit {
+                            placeholder-text: "deixe em branco para não verificar";
+                            accessible-label: "Hash SHA-256 esperado";
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        background: Theme.border;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 10px;
+                        schedule_switch := Switch {
+                            text: "Agendar em UTC";
+                            checked: root.schedule_focus;
+                            accessible-label: "Agendar o download em uma janela UTC";
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        FieldLabel { text: "De"; }
+                        schedule_start_entry := LineEdit {
+                            text: "09:00";
+                            width: 70px;
+                            accessible-label: "Início da janela de agendamento em UTC";
+                        }
+                        FieldLabel { text: "até"; }
+                        schedule_end_entry := LineEdit {
+                            text: "17:00";
+                            width: 70px;
+                            accessible-label: "Fim da janela de agendamento em UTC";
+                        }
+                    }
+
+                    Text {
+                        text: "Janela igual de início e fim significa o dia inteiro; janelas noturnas são suportadas.";
+                        color: Theme.text_muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                        accessible-role: none;
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    Text {
+                        text: root.add_dialog_error;
+                        color: Theme.danger;
+                        font-size: 12px;
+                        visible: root.add_dialog_error != "";
+                        wrap: word-wrap;
+                        accessible-role: text;
+                        accessible-label: root.add_dialog_error;
+                        accessible-live-region: assertive;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle { horizontal-stretch: 1; }
+                        Button {
+                            text: "Cancelar";
+                            clicked => {
+                                root.add_dialog_error = "";
+                                root.add_dialog_open = false;
+                                add-popup.close();
                             }
                         }
                         Button {
-                            text: "Pause";
-                            enabled: item.can_pause;
-                            clicked => { root.job_action(item.id, "pause"); }
-                        }
-                        Button {
-                            text: "Resume";
-                            enabled: item.can_resume;
-                            clicked => { root.job_action(item.id, "resume"); }
-                        }
-                        Button {
-                            text: "Cancel";
-                            enabled: item.can_cancel;
-                            clicked => { root.job_action(item.id, "cancel"); }
+                            text: "Adicionar";
+                            primary: true;
+                            clicked => {
+                                if (url_entry.text == "") {
+                                    root.add_dialog_error = "Informe a URL do download.";
+                                } else if (hash_entry.text != "" && hash_entry.text.character-count != 64) {
+                                    root.add_dialog_error = "O SHA-256 esperado deve ter 64 caracteres hexadecimais.";
+                                } else if (schedule_switch.checked && (schedule_start_entry.text == "" || schedule_end_entry.text == "")) {
+                                    root.add_dialog_error = "Informe o início e o fim da janela de agendamento (UTC).";
+                                } else {
+                                    root.add_dialog_error = "";
+                                    root.add_url(
+                                        url_entry.text,
+                                        hash_entry.text,
+                                        priority_box.current-value,
+                                        segments_box.current-value,
+                                        speed_entry.text,
+                                        schedule_switch.checked,
+                                        schedule_start_entry.text,
+                                        schedule_end_entry.text
+                                    );
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        HorizontalLayout {
-            spacing: 10px;
-            Text { text: "History"; color: #f4f7fb; font-size: 20px; font-weight: 600; horizontal-stretch: 1; }
-            Button { text: "Clear history"; clicked => { root.clear_history(); } }
-        }
-        Text {
-            text: "History is saved automatically (up to 500 entries); URL query and fragment values are omitted.";
-            color: #8996a4;
-            font-size: 12px;
-            wrap: word-wrap;
-        }
-        ScrollView {
-            height: 145px;
+    }
+
+    // =========================================================================
+    // Popup: options / transfer limits
+    // =========================================================================
+    options-popup := PopupWindow {
+        x: (root.width - 500px) / 2;
+        y: (root.height - 420px) / 2;
+        width: 500px;
+        height: 420px;
+        close-policy: no-auto-close;
+
+        Rectangle {
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border_strong;
+            border-radius: 6px;
+            drop-shadow-color: #1b223399;
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 3px;
+
             VerticalLayout {
-                spacing: 5px;
-                for item in root.history: Text {
-                    text: item.details;
-                    color: #c4cfda;
-                    font-size: 12px;
-                    wrap: word-wrap;
+                spacing: 0;
+
+                Rectangle {
+                    height: 40px;
+                    background: Theme.surface_alt;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 8px;
+                        Text {
+                            text: "Opções de transferência";
+                            color: Theme.text_primary;
+                            font-size: 15px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            accessible-role: text;
+                            accessible-label: "Opções de transferência";
+                        }
+                        Button {
+                            text: "Fechar";
+                            clicked => {
+                                root.options_dialog_open = false;
+                                options-popup.close();
+                            }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.border; }
+
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 10px;
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            horizontal-stretch: 1;
+                            FieldLabel { text: "Downloads simultâneos (1-8, requer reinício)"; }
+                            active_entry := LineEdit {
+                                text: root.max_active;
+                                input-type: number;
+                                accessible-label: "Número de downloads simultâneos";
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            width: 120px;
+                            FieldLabel { text: "Segmentos (1-4)"; }
+                            max_segments_entry := LineEdit {
+                                text: root.max_segments;
+                                input-type: number;
+                                accessible-label: "Limite de segmentos por download";
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        FieldLabel { text: "Velocidade por download (KB/s; 0 = sem limite)"; }
+                        opt_speed_entry := LineEdit {
+                            text: root.speed_limit;
+                            input-type: number;
+                            accessible-label: "Limite de velocidade por download em quilobytes por segundo";
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        FieldLabel { text: "Limite global de banda (bytes/s; 0 = sem limite)"; }
+                        global_bandwidth_entry := LineEdit {
+                            text: root.global_bandwidth_limit;
+                            input-type: number;
+                            accessible-label: "Limite global de banda em bytes por segundo";
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            horizontal-stretch: 1;
+                            FieldLabel { text: "Tamanho máximo por download (MiB)"; }
+                            max_size_entry := LineEdit {
+                                text: root.max_download_mib;
+                                input-type: number;
+                                accessible-label: "Tamanho máximo por download em mebibytes";
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            width: 150px;
+                            FieldLabel { text: "Duração máxima (minutos)"; }
+                            max_duration_entry := LineEdit {
+                                text: root.max_duration_minutes;
+                                input-type: number;
+                                accessible-label: "Duração máxima em minutos";
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "O limite global é um ritmo médio por instância, não um teto instantâneo. Segmentos só são tentados em arquivos de 8 MiB ou mais, após uma sondagem estrita de Range, Content-Length e ETag forte.";
+                        color: Theme.text_muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                        accessible-role: none;
+                    }
+
+                    Rectangle { vertical-stretch: 1; }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            text: root.cleanup_retry_in_progress ? "Repetindo limpeza…" : "Repetir limpeza pendente";
+                            enabled: root.has_pending_cleanup && !root.cleanup_retry_in_progress;
+                            clicked => { root.retry_pending_cleanup(); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button {
+                            text: "Cancelar";
+                            clicked => {
+                                root.options_dialog_open = false;
+                                options-popup.close();
+                            }
+                        }
+                        Button {
+                            text: "Salvar";
+                            primary: true;
+                            clicked => {
+                                root.save_limits(
+                                    active_entry.text,
+                                    opt_speed_entry.text,
+                                    global_bandwidth_entry.text,
+                                    max_size_entry.text,
+                                    max_duration_entry.text,
+                                    max_segments_entry.text
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
 
-        Text {
-            text: "Progress is per job. ETA is approximate and appears only with a validated total and stable measured speed; unknown-length transfers show bytes without ETA. It resets while resuming and stays fixed while paused. SHA-256 covers the staging handle, not local writers racing the pathname commit; re-hash the destination for adversarial integrity. No cookies, credentials, browser session data, or DRM circumvention; redirects are not followed.";
-            color: #8996a4;
-            font-size: 12px;
-            wrap: word-wrap;
+    // =========================================================================
+    // Popup: history
+    // =========================================================================
+    history-popup := PopupWindow {
+        x: (root.width - 600px) / 2;
+        y: (root.height - 440px) / 2;
+        width: 600px;
+        height: 440px;
+        close-policy: no-auto-close;
+
+        Rectangle {
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border_strong;
+            border-radius: 6px;
+            drop-shadow-color: #1b223399;
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 3px;
+
+            VerticalLayout {
+                spacing: 0;
+
+                Rectangle {
+                    height: 40px;
+                    background: Theme.surface_alt;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 8px;
+                        spacing: 8px;
+                        Text {
+                            text: "Histórico de downloads";
+                            color: Theme.text_primary;
+                            font-size: 15px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            accessible-role: text;
+                            accessible-label: "Histórico de downloads";
+                        }
+                        Button {
+                            text: "Limpar histórico";
+                            clicked => { root.clear_history(); }
+                        }
+                        Button {
+                            text: "Fechar";
+                            clicked => {
+                                root.history_dialog_open = false;
+                                history-popup.close();
+                            }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: Theme.border; }
+
+                Rectangle {
+                    height: 42px;
+                    background: Theme.surface;
+                    HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 8px;
+                        Text {
+                            text: "O histórico é salvo automaticamente (até 500 entradas); valores de query e fragmento da URL são omitidos.";
+                            color: Theme.text_muted;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                            accessible-role: none;
+                        }
+                    }
+                }
+
+                ScrollView {
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 4px;
+                        for entry in root.history: Rectangle {
+                            height: 28px;
+                            background: Theme.surface_alt;
+                            border-radius: 4px;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                Text {
+                                    text: entry.details;
+                                    color: Theme.text_secondary;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    max-lines: 1;
+                                    accessible-role: text;
+                                    accessible-label: entry.details;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Popup: about
+    // =========================================================================
+    about-popup := PopupWindow {
+        x: (root.width - 440px) / 2;
+        y: (root.height - 240px) / 2;
+        width: 440px;
+        height: 240px;
+        close-policy: no-auto-close;
+
+        Rectangle {
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border_strong;
+            border-radius: 6px;
+            drop-shadow-color: #1b223399;
+            drop-shadow-blur: 14px;
+            drop-shadow-offset-y: 3px;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    AppIcon {
+                        icon_name: "downloads";
+                        icon_color: Theme.accent;
+                        icon_size: 40px;
+                        horizontal-stretch: 0;
+                    }
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text {
+                            text: "Independent Download Manager";
+                            color: Theme.text_primary;
+                            font-size: 17px;
+                            font-weight: 700;
+                            accessible-role: text;
+                            accessible-label: "Independent Download Manager";
+                        }
+                        Text {
+                            text: "Versão 0.1.0 — gerenciador de downloads HTTP(S) independente";
+                            color: Theme.text_secondary;
+                            font-size: 12px;
+                            accessible-role: none;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Transferências HTTP(S) diretas: adicionar URL, agendar em UTC, prioridade, segmentos, limite de velocidade e verificação SHA-256. Sem cookies, credenciais, dados de sessão do navegador ou quebra de DRM; redirecionamentos não são seguidos.";
+                    color: Theme.text_secondary;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    accessible-role: none;
+                }
+
+                Text {
+                    text: "Não suportado nesta versão: Grabber, compactador de arquivos e registro do produto.";
+                    color: Theme.text_muted;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    accessible-role: none;
+                }
+
+                Rectangle { vertical-stretch: 1; }
+
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Fechar";
+                        primary: true;
+                        clicked => {
+                            root.about_dialog_open = false;
+                            about-popup.close();
+                        }
+                    }
+                }
+            }
         }
     }
 }

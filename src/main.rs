@@ -55,6 +55,401 @@ const HISTORY_LIMIT: usize = 500;
 const SETTINGS_LOAD_WARNING: &str =
     "Settings could not be read or are invalid; safe defaults are in use.";
 
+/// Categories shown in the left tree. The identifiers match the ones used by
+/// the Slint side (`ui/main.slint`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Category {
+    #[default]
+    All,
+    Incomplete,
+    Complete,
+    Tasks,
+    Documents,
+    Music,
+    Programs,
+    Video,
+}
+
+impl Category {
+    fn from_id(id: &str) -> Category {
+        match id {
+            "incomplete" => Category::Incomplete,
+            "complete" => Category::Complete,
+            "tasks" => Category::Tasks,
+            "documents" => Category::Documents,
+            "music" => Category::Music,
+            "programs" => Category::Programs,
+            "video" => Category::Video,
+            _ => Category::All,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Category::All => "all",
+            Category::Incomplete => "incomplete",
+            Category::Complete => "complete",
+            Category::Tasks => "tasks",
+            Category::Documents => "documents",
+            Category::Music => "music",
+            Category::Programs => "programs",
+            Category::Video => "video",
+        }
+    }
+}
+
+/// State shared between the UI thread and the background queue: the last
+/// snapshot of the queue plus the view selection.
+#[derive(Default)]
+struct UiState {
+    snapshots: Vec<JobSnapshot>,
+    category: Category,
+    selected_id: String,
+}
+
+fn can_pause_job(state: &JobState) -> bool {
+    matches!(
+        state,
+        JobState::Queued | JobState::Scheduled | JobState::Downloading
+    )
+}
+
+fn can_resume_job(state: &JobState) -> bool {
+    matches!(state, JobState::Paused)
+}
+
+fn can_cancel_job(state: &JobState) -> bool {
+    can_pause_job(state) || can_resume_job(state)
+}
+
+/// File type bucket used by the category tree. Archives are intentionally not
+/// mapped: the application has no archive category.
+fn job_file_category(job: &JobSnapshot) -> Category {
+    let extension = job
+        .destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Path::new(name).extension().and_then(|value| value.to_str()))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "pdf" | "doc" | "docx" | "odt" | "rtf" | "txt" | "md" | "epub" | "mobi" | "xls"
+        | "xlsx" | "ods" | "csv" | "ppt" | "pptx" | "odp" => Category::Documents,
+        "mp3" | "flac" | "wav" | "ogg" | "oga" | "m4a" | "aac" | "opus" | "wma" => Category::Music,
+        "exe" | "msi" | "apk" | "deb" | "rpm" | "appimage" | "jar" | "bat" | "cmd" | "sh" => {
+            Category::Programs
+        }
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "m4v" | "wmv" | "mpg" | "mpeg" => {
+            Category::Video
+        }
+        _ => Category::All,
+    }
+}
+
+fn job_matches_category(job: &JobSnapshot, category: Category) -> bool {
+    match category {
+        Category::All => true,
+        Category::Incomplete => !is_terminal_state(&job.state),
+        Category::Complete => matches!(job.state, JobState::Completed(_)),
+        Category::Tasks => matches!(job.state, JobState::Queued | JobState::Scheduled),
+        other => job_file_category(job) == other,
+    }
+}
+
+fn describe_state(state: &JobState) -> (&'static str, &'static str) {
+    match state {
+        JobState::Queued => ("Na fila", "queued"),
+        JobState::Scheduled => ("Agendado", "queued"),
+        JobState::Downloading => ("Baixando", "active"),
+        JobState::Paused => ("Pausado", "paused"),
+        JobState::Completed(_) => ("Concluído", "done"),
+        JobState::Failed(_) | JobState::FailedCleanupPending { .. } => ("Falhou", "error"),
+        JobState::Cancelled | JobState::CancelledCleanupPending(_) => ("Cancelado", "muted"),
+    }
+}
+
+fn priority_label(priority: Priority) -> &'static str {
+    match priority {
+        Priority::Low => "Baixa",
+        Priority::Normal => "Normal",
+        Priority::High => "Alta",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_speed(bytes_per_second: u64) -> String {
+    format!("{}/s", format_bytes(bytes_per_second))
+}
+
+/// Builds the rows shown in the download list for the given category.
+fn build_job_rows(snapshots: &[JobSnapshot], category: Category) -> Vec<JobRow> {
+    snapshots
+        .iter()
+        .filter(|job| job_matches_category(job, category))
+        .map(|job| {
+            let name = job
+                .destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("download")
+                .to_owned();
+            let can_pause = can_pause_job(&job.state);
+            let can_resume = can_resume_job(&job.state);
+            let can_cancel = can_cancel_job(&job.state);
+            let can_set_priority = can_change_job_priority(&job.state);
+            let bytes = match &job.state {
+                JobState::Completed(result) => result.bytes,
+                _ => job.bytes_received,
+            };
+            let total = job.total_bytes.filter(|total| *total > 0);
+            let progress = match total {
+                Some(total) => (bytes as f32 / total as f32).clamp(0.0, 1.0),
+                None => -1.0f32,
+            };
+            let progress_text = match total {
+                Some(total) => format!("{}%", (bytes as f64 * 100.0 / total as f64) as u64),
+                None => "—".to_owned(),
+            };
+            let show_estimate = matches!(&job.state, JobState::Downloading | JobState::Paused);
+            let speed = if show_estimate {
+                job.speed_bytes_per_second.filter(|speed| *speed > 0)
+            } else {
+                None
+            };
+            let speed_text = speed.map(format_speed).unwrap_or_else(|| "—".to_owned());
+            let eta_text = match (total, speed, job.eta_seconds) {
+                (Some(total), Some(_), Some(seconds)) if total > bytes => format_eta(seconds),
+                _ => "—".to_owned(),
+            };
+            let size_text = match total {
+                Some(total) => format_bytes(total),
+                None => format_bytes(bytes),
+            };
+            let (status_text, status_kind) = describe_state(&job.state);
+            let progress_details = format_job_progress(
+                bytes,
+                job.total_bytes,
+                speed,
+                if speed.is_some() {
+                    job.eta_seconds
+                } else {
+                    None
+                },
+            );
+            let details = match &job.state {
+                JobState::Completed(result) => {
+                    let cleanup = result
+                        .cleanup_pending
+                        .as_ref()
+                        .map(|message| format!(" · cleanup pending: {message}"))
+                        .unwrap_or_default();
+                    format!(
+                        "Completed · {} bytes · staging SHA-256 {}{}",
+                        result.bytes, result.sha256, cleanup
+                    )
+                }
+                JobState::CancelledCleanupPending(error) => {
+                    format!("Cancelled · {progress_details} · cleanup pending: {error}")
+                }
+                JobState::FailedCleanupPending {
+                    operation,
+                    cleanup_error,
+                } => format!("{operation} · {progress_details} · cleanup pending: {cleanup_error}"),
+                JobState::Failed(error) => format!("Failed · {progress_details} · {error}"),
+                state => format!("{} · {progress_details}", state.label()),
+            };
+            JobRow {
+                id: job.id.to_string().into(),
+                name: name.clone().into(),
+                url: safe_display_url(&job.url).into(),
+                details: SharedString::from(format!("{details} — {name}")),
+                size_text: size_text.into(),
+                status_text: status_text.into(),
+                status_kind: status_kind.into(),
+                progress,
+                progress_text: progress_text.into(),
+                eta_text: eta_text.into(),
+                speed_text: speed_text.into(),
+                priority: priority_label(job.priority).into(),
+                category: job_file_category(job).id().into(),
+                can_set_priority,
+                can_pause,
+                can_resume,
+                can_cancel,
+            }
+        })
+        .collect()
+}
+
+/// Pushes the cached queue state into the window: rows, counters, status bar
+/// and the capabilities of the selected row.
+fn apply_ui_state(window: &MainWindow, ui_state: &Arc<Mutex<UiState>>) {
+    let (rows, counts, active, queued, completed, speed, selection, bulk) = {
+        let state = ui_state.lock().expect("ui state lock");
+        let rows = build_job_rows(&state.snapshots, state.category);
+        let mut counts = [0usize; 8];
+        for job in &state.snapshots {
+            for (index, category) in [
+                Category::All,
+                Category::Incomplete,
+                Category::Complete,
+                Category::Tasks,
+                Category::Documents,
+                Category::Music,
+                Category::Programs,
+                Category::Video,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if job_matches_category(job, category) {
+                    counts[index] += 1;
+                }
+            }
+        }
+        let active = state
+            .snapshots
+            .iter()
+            .filter(|job| matches!(job.state, JobState::Downloading))
+            .count();
+        let queued = state
+            .snapshots
+            .iter()
+            .filter(|job| matches!(job.state, JobState::Queued | JobState::Scheduled))
+            .count();
+        let completed = state
+            .snapshots
+            .iter()
+            .filter(|job| matches!(job.state, JobState::Completed(_)))
+            .count();
+        let speed: u64 = state
+            .snapshots
+            .iter()
+            .filter(|job| matches!(job.state, JobState::Downloading))
+            .filter_map(|job| job.speed_bytes_per_second)
+            .sum();
+        let selected = state
+            .snapshots
+            .iter()
+            .find(|job| job.id.to_string() == state.selected_id)
+            .cloned();
+        let index = rows
+            .iter()
+            .position(|row| row.id.as_str() == state.selected_id)
+            .map(|index| index as i32)
+            .unwrap_or(-1);
+        let details = rows
+            .iter()
+            .find(|row| row.id.as_str() == state.selected_id)
+            .map(|row| row.details.to_string())
+            .unwrap_or_default();
+        let bulk = (
+            state.snapshots.iter().any(|job| can_pause_job(&job.state)),
+            state.snapshots.iter().any(|job| can_resume_job(&job.state)),
+            state.snapshots.iter().any(|job| can_cancel_job(&job.state)),
+        );
+        (
+            rows,
+            counts,
+            active,
+            queued,
+            completed,
+            speed,
+            (selected, index, details),
+            bulk,
+        )
+    };
+
+    window.set_jobs(ModelRc::new(VecModel::from(rows)));
+    window.set_count_all_text(count_badge(counts[0]));
+    window.set_count_incomplete_text(count_badge(counts[1]));
+    window.set_count_complete_text(count_badge(counts[2]));
+    window.set_count_tasks_text(count_badge(counts[3]));
+    window.set_count_documents_text(count_badge(counts[4]));
+    window.set_count_music_text(count_badge(counts[5]));
+    window.set_count_programs_text(count_badge(counts[6]));
+    window.set_count_video_text(count_badge(counts[7]));
+    window.set_active_count_text(active.to_string().into());
+    window.set_queued_count_text(queued.to_string().into());
+    window.set_completed_count_text(completed.to_string().into());
+    window.set_global_speed_text(format_speed(speed).into());
+
+    let (can_pause_all, can_resume_all, can_cancel_all) = bulk;
+    window.set_can_pause_all(can_pause_all);
+    window.set_can_resume_all(can_resume_all);
+    window.set_can_cancel_all(can_cancel_all);
+    let (selected, index, details) = selection;
+    let selected = selected.as_ref();
+    window.set_selected_index(index);
+    window.set_selected_job_details(details.into());
+    window.set_selected_job_can_pause(selected.is_some_and(|job| can_pause_job(&job.state)));
+    window.set_selected_job_can_resume(selected.is_some_and(|job| can_resume_job(&job.state)));
+    window.set_selected_job_can_cancel(selected.is_some_and(|job| can_cancel_job(&job.state)));
+    window.set_selected_job_can_set_priority(
+        selected.is_some_and(|job| can_change_job_priority(&job.state)),
+    );
+}
+
+fn count_badge(count: usize) -> SharedString {
+    if count == 0 {
+        SharedString::default()
+    } else {
+        SharedString::from(count.to_string())
+    }
+}
+
+fn parse_priority(raw: &str) -> Result<Priority, String> {
+    match raw.trim() {
+        "Low" | "Baixa" => Ok(Priority::Low),
+        "Normal" => Ok(Priority::Normal),
+        "High" | "Alta" => Ok(Priority::High),
+        _ => Err("Unknown download priority.".to_owned()),
+    }
+}
+
+fn parse_segments(raw: &str) -> Result<u8, String> {
+    let value: u8 = raw
+        .trim()
+        .parse()
+        .map_err(|_| "The segment limit must be a number between 1 and 4.".to_owned())?;
+    if !(1..=MAX_SEGMENT_COUNT).contains(&value) {
+        return Err(format!(
+            "The segment limit must be between 1 and {MAX_SEGMENT_COUNT}."
+        ));
+    }
+    Ok(value)
+}
+
+/// Parses the per-download speed cap expressed in KiB/s. `None` means the
+/// instance default applies.
+fn parse_speed_kib(raw: &str) -> Result<Option<u64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let value: u64 = trimmed
+        .parse()
+        .map_err(|_| "The speed limit must be a number in KB/s.".to_owned())?;
+    if value > 1_000_000 {
+        return Err("The speed limit must be at most 1,000,000 KB/s.".to_owned());
+    }
+    Ok((value > 0).then_some(value.saturating_mul(1024)))
+}
+
 struct LoadedSettings {
     settings: Settings,
     warning: Option<&'static str>,
@@ -316,21 +711,149 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let handle = runtime.handle().clone();
     let weak = window.as_weak();
+    let ui_state = Arc::new(Mutex::new(UiState::default()));
+    window.set_downloads_dir(downloads_dir.to_string_lossy().to_string().into());
+    {
+        let ui_state = ui_state.clone();
+        let weak = weak.clone();
+        window.on_select_category(move |raw_category| {
+            let category = Category::from_id(raw_category.as_ref());
+            {
+                let mut state = ui_state.lock().expect("ui state lock");
+                state.category = category;
+            }
+            let ui_state = ui_state.clone();
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_selected_category(category.id().into());
+                    apply_ui_state(&window, &ui_state);
+                }
+            });
+        });
+    }
+    {
+        let ui_state = ui_state.clone();
+        let weak = weak.clone();
+        window.on_select_job(move |raw_id| {
+            let id = raw_id.to_string();
+            {
+                let mut state = ui_state.lock().expect("ui state lock");
+                state.selected_id = id.clone();
+            }
+            let ui_state = ui_state.clone();
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_selected_job_id(id.into());
+                    apply_ui_state(&window, &ui_state);
+                }
+            });
+        });
+    }
+    {
+        let ui_state = ui_state.clone();
+        let weak = weak.clone();
+        window.on_move_selection(move |raw_index| {
+            let requested = raw_index;
+            let selected = {
+                let mut state = ui_state.lock().expect("ui state lock");
+                let rows = build_job_rows(&state.snapshots, state.category);
+                if rows.is_empty() {
+                    None
+                } else {
+                    let index = requested.clamp(0, rows.len() as i32 - 1) as usize;
+                    let id = rows[index].id.to_string();
+                    state.selected_id = id.clone();
+                    Some(id)
+                }
+            };
+            let Some(selected) = selected else { return };
+            let ui_state = ui_state.clone();
+            let weak = weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = weak.upgrade() {
+                    window.set_selected_job_id(selected.clone().into());
+                    apply_ui_state(&window, &ui_state);
+                }
+            });
+        });
+    }
+    {
+        let queue = queue.clone();
+        let weak = weak.clone();
+        let handle = runtime.handle().clone();
+        window.on_bulk_action(move |raw_action| {
+            let action = raw_action.to_string();
+            let queue = queue.clone();
+            let weak = weak.clone();
+            handle.spawn(async move {
+                let snapshots = queue.snapshots().await;
+                let mut affected = 0usize;
+                let mut failures: Vec<String> = Vec::new();
+                for job in &snapshots {
+                    let outcome = match action.as_str() {
+                        "pause-all" if can_pause_job(&job.state) => queue.pause(job.id).await,
+                        "resume-all" if can_resume_job(&job.state) => queue.resume(job.id).await,
+                        "cancel-all" if can_cancel_job(&job.state) => queue.cancel(job.id).await,
+                        _ => continue,
+                    };
+                    match outcome {
+                        Ok(()) => affected += 1,
+                        Err(error) => failures.push(format!("{}: {error}", job.id)),
+                    }
+                }
+                let message = match action.as_str() {
+                    "pause-all" => format!("Paused {affected} download(s)."),
+                    "resume-all" => format!("Resumed {affected} download(s)."),
+                    "cancel-all" => format!("Cancelled {affected} download(s)."),
+                    other => format!("Unknown bulk action: {other}"),
+                };
+                let message = if failures.is_empty() {
+                    message
+                } else {
+                    format!("{message} Failed: {}", failures.join("; "))
+                };
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = weak.upgrade() {
+                        window.set_status(message.into());
+                    }
+                });
+            });
+        });
+    }
+    {
+        window.on_quit_app(move || {
+            let _ = slint::quit_event_loop();
+        });
+    }
     {
         let queue = queue.clone();
         let settings = settings.clone();
         let downloads_dir = downloads_dir.clone();
         let history_path = history_path.clone();
+        let add_settings_path = settings_path.clone();
         window.on_add_url(
-            move |raw_url, raw_sha256, schedule_enabled, schedule_start, schedule_end| {
+            move |raw_url,
+                  raw_sha256,
+                  raw_priority,
+                  raw_segments,
+                  raw_speed,
+                  schedule_enabled,
+                  schedule_start,
+                  schedule_end| {
                 let url = raw_url.to_string();
                 let expected_hash = raw_sha256.to_string();
+                let priority = raw_priority.to_string();
+                let segments = raw_segments.to_string();
+                let speed = raw_speed.to_string();
                 let schedule_start = schedule_start.to_string();
                 let schedule_end = schedule_end.to_string();
                 let destination_dir = downloads_dir.clone();
                 let queue = queue.clone();
                 let settings = settings.clone();
                 let history_path = history_path.clone();
+                let settings_path = add_settings_path.clone();
                 let weak = weak.clone();
                 handle.spawn(async move {
                     let result = async {
@@ -338,6 +861,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .map_err(|error| error.to_string())?
                             .to_string();
                         let expected_sha256 = parse_expected_sha256(&expected_hash)?;
+                        let priority = parse_priority(&priority)?;
+                        let segments = parse_segments(&segments)?;
+                        let requested_speed = parse_speed_kib(&speed)?;
                         let schedule = if schedule_enabled {
                             Some(
                                 DailyWindow::parse_utc_range(&schedule_start, &schedule_end)
@@ -355,17 +881,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .lock()
                             .map_err(|_| "settings unavailable".to_owned())?
                             .clone();
+                        // The engine applies the segment limit to the whole instance, so the
+                        // value chosen in the dialog is stored as the instance setting.
+                        queue
+                            .set_max_segments(segments)
+                            .map_err(|error| error.to_string())?;
+                        let mut next_settings = current_settings.clone();
+                        next_settings.max_segments = segments;
+                        if let Err(error) = save_settings(&settings_path, &next_settings) {
+                            return Err(format!("Could not save the segment limit: {error}"));
+                        }
+                        replace_settings_state(&settings, next_settings);
+                        let bytes_per_second = requested_speed.or_else(|| {
+                            (current_settings.default_speed_kib_per_second > 0).then(|| {
+                                current_settings
+                                    .default_speed_kib_per_second
+                                    .saturating_mul(1024)
+                            })
+                        });
                         let request = DownloadRequest {
                             url: url.clone(),
                             destination,
                             expected_sha256,
                             max_retries: 3,
-                            bytes_per_second: (current_settings.default_speed_kib_per_second > 0)
-                                .then(|| {
-                                    current_settings
-                                        .default_speed_kib_per_second
-                                        .saturating_mul(1024)
-                                }),
+                            bytes_per_second,
                             max_bytes: current_settings
                                 .max_download_mib
                                 .saturating_mul(1024 * 1024),
@@ -373,18 +912,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 current_settings.max_duration_minutes.saturating_mul(60),
                             ),
                         };
-                        enqueue_with_history_generation(&queue, &history_path, request, schedule)
-                            .await
-                            .map_err(|error| error.to_string())
+                        let id = enqueue_with_history_generation(
+                            &queue,
+                            &history_path,
+                            request,
+                            schedule,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        if let Err(error) = queue.set_priority(id, priority).await {
+                            return Err(format!(
+                                "Queued, but the priority could not be applied: {error}"
+                            ));
+                        }
+                        Ok(filename)
                     }
                     .await;
-                    let message = match result {
-                        Ok(_) => format!("Queued: {}", filename_from_url(&url)),
-                        Err(error) => error,
+                    let (message, failed) = match result {
+                        Ok(filename) => (format!("Queued: {filename}"), false),
+                        Err(error) => (error, true),
                     };
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(window) = weak.upgrade() {
-                            window.set_status(message.into());
+                            window.set_status(message.clone().into());
+                            if failed {
+                                window.set_add_dialog_error(message.into());
+                            } else {
+                                window.set_add_dialog_error("".into());
+                                window.set_add_dialog_open(false);
+                                window.set_max_segments(segments.to_string().into());
+                            }
                         }
                     });
                 });
@@ -664,6 +1221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let history_store = history_store.clone();
         let notification_tracker = notification_tracker.clone();
         let progress_announcement_tracker = progress_announcement_tracker.clone();
+        let ui_state = ui_state.clone();
         let weak = window.as_weak();
         let handle: Handle = runtime.handle().clone();
         let inbox_poll_gate = InboxPollGate::default();
@@ -679,6 +1237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let history_store = history_store.clone();
             let notification_tracker = notification_tracker.clone();
             let progress_announcement_tracker = progress_announcement_tracker.clone();
+            let ui_state = ui_state.clone();
             let weak = weak.clone();
             handle.spawn(async move {
                 let _poll_guard = poll_guard;
@@ -776,87 +1335,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let has_pending_cleanup = snapshots
                     .iter()
                     .any(|job| job_has_pending_cleanup(&job.state));
-                let can_set_priority_ids = snapshots
-                    .iter()
-                    .filter(|job| can_change_job_priority(&job.state))
-                    .map(|job| job.id.to_string())
-                    .collect::<HashSet<_>>();
-                let rows = snapshots
-                    .into_iter()
-                    .map(|job| {
-                        let name = job
-                            .destination
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("download");
-                        let can_pause = matches!(
-                            &job.state,
-                            JobState::Queued | JobState::Scheduled | JobState::Downloading
-                        );
-                        let can_set_priority = can_change_job_priority(&job.state);
-                        let can_resume = matches!(&job.state, JobState::Paused);
-                        let can_cancel = can_pause || can_resume;
-                        let bytes = match &job.state {
-                            JobState::Completed(result) => result.bytes,
-                            _ => job.bytes_received,
-                        };
-                        let show_estimate = matches!(
-                            &job.state,
-                            JobState::Downloading | JobState::Paused
-                        );
-                        let (speed_bytes_per_second, eta_seconds) = if show_estimate {
-                            (job.speed_bytes_per_second, job.eta_seconds)
-                        } else {
-                            (None, None)
-                        };
-                        let progress_details = format_job_progress(
-                            bytes,
-                            job.total_bytes,
-                            speed_bytes_per_second,
-                            eta_seconds,
-                        );
-                        let details = match &job.state {
-                            JobState::Completed(result) => {
-                                let cleanup = result
-                                    .cleanup_pending
-                                    .as_ref()
-                                    .map(|message| format!(" · cleanup pending: {message}"))
-                                    .unwrap_or_default();
-                                format!(
-                                    "Completed · {} bytes · staging SHA-256 {}{}",
-                                    result.bytes, result.sha256, cleanup
-                                )
-                            }
-                            JobState::CancelledCleanupPending(error) => {
-                                format!("Cancelled · {progress_details} · cleanup pending: {error}")
-                            }
-                            JobState::FailedCleanupPending {
-                                operation,
-                                cleanup_error,
-                            } => {
-                                format!(
-                                    "{operation} · {progress_details} · cleanup pending: {cleanup_error}"
-                                )
-                            }
-                            JobState::Failed(error) => {
-                                format!("Failed · {progress_details} · {error}")
-                            }
-                            state => format!("{} · {progress_details}", state.label()),
-                        };
-                        JobRow {
-                            id: job.id.to_string().into(),
-                            details: SharedString::from(format!(
-                                "{details} — {name} — {}",
-                                safe_display_url(&job.url)
-                            )),
-                            priority: SharedString::from(job.priority.label()),
-                            can_set_priority,
-                            can_pause,
-                            can_resume,
-                            can_cancel,
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                {
+                    let mut state = ui_state.lock().expect("ui state lock");
+                    state.snapshots = snapshots.clone();
+                }
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(window) = weak.upgrade() {
                         if let Some(message) = status_message {
@@ -870,11 +1352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         window.set_has_pending_cleanup(has_pending_cleanup);
                         window.set_history(ModelRc::new(VecModel::from(history_rows)));
-                        let selected_id = window.get_selected_job_id().to_string();
-                        window.set_selected_job_can_set_priority(
-                            can_set_priority_ids.contains(&selected_id),
-                        );
-                        window.set_jobs(ModelRc::new(VecModel::from(rows)));
+                        apply_ui_state(&window, &ui_state);
                     }
                 });
             });
