@@ -2256,10 +2256,7 @@ fn replace_settings_file(source: &Path, destination: &Path) -> std::io::Result<(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            io::ErrorKind::Other,
-            "replacing the settings file did not succeed within the retry budget",
-        )
+        std::io::Error::other("replacing the settings file did not succeed within the retry budget")
     }))
 }
 

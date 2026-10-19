@@ -564,8 +564,25 @@ async fn cancellation_removes_all_segment_temporaries() {
     server.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
+/// The absolute timeout must leave the cleanup pending for a manual retry and
+/// must never publish an orphaned temporary as a valid destination.
+///
+/// The transfer runs over a real socket, so the scenario uses the real clock.
+/// A paused clock jumps straight to the next timer deadline as soon as the
+/// runtime parks, which expires the absolute deadline before the stalled
+/// segment ever delivers its first byte and leaves the test waiting forever.
+/// Every wait below is bounded, so the test always terminates.
+#[tokio::test]
 async fn absolute_timeout_keeps_cleanup_pending_for_manual_retry() {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        absolute_timeout_keeps_cleanup_pending_for_manual_retry_scenario(),
+    )
+    .await
+    .expect("the absolute-timeout cleanup scenario must finish within its budget");
+}
+
+async fn absolute_timeout_keeps_cleanup_pending_for_manual_retry_scenario() {
     let body = payload();
     let server = LocalRangeServer::start(body, ServerBehavior::StallSegment).await;
     let directory = tempfile::tempdir().unwrap();
@@ -577,7 +594,7 @@ async fn absolute_timeout_keeps_cleanup_pending_for_manual_retry() {
     let worker_destination = destination.clone();
     let worker = tokio::spawn(async move {
         download_with_session_managed_with_limiter_segments_and_slots(
-            request(worker_url, worker_destination, Duration::from_secs(1)),
+            request(worker_url, worker_destination, Duration::from_secs(3)),
             CancellationToken::new(),
             &worker_session,
             &limiter,
@@ -587,12 +604,20 @@ async fn absolute_timeout_keeps_cleanup_pending_for_manual_retry() {
         .await
     });
 
-    session.wait_for_bytes(1).await;
-    tokio::time::advance(Duration::from_secs(2)).await;
-    assert!(matches!(
-        worker.await.unwrap(),
-        Err(DownloadError::CleanupPending { .. })
-    ));
+    // The stalled segment delivers its first byte well before the absolute
+    // deadline; without it the transfer never reaches the cleanup step.
+    tokio::time::timeout(Duration::from_secs(10), session.wait_for_bytes(1))
+        .await
+        .expect("the stalled segment must deliver its first byte before the deadline");
+    // The absolute deadline ends the transfer while the segment is still open.
+    let outcome = tokio::time::timeout(Duration::from_secs(20), worker)
+        .await
+        .expect("the absolute deadline must end the stalled transfer")
+        .expect("the transfer task must not panic");
+    assert!(
+        matches!(outcome, Err(DownloadError::CleanupPending { .. })),
+        "the absolute timeout must report a pending cleanup, got {outcome:?}"
+    );
     assert!(!destination.exists());
     assert!(!session.segment_temp_paths.lock().unwrap().is_empty());
     // The manual retry removes the staging directory once the transfer's
