@@ -2149,17 +2149,49 @@ fn replace_settings_file(source: &Path, destination: &Path) -> std::io::Result<(
     std::fs::rename(source, destination)
 }
 
+/// Windows error codes that a concurrent writer of the same destination can
+/// raise while the replacement is in flight.
+///
+/// `ERROR_UNABLE_TO_REMOVE_REPLACED` (1175) and
+/// `ERROR_UNABLE_TO_MOVE_REPLACEMENT` (1176) are the documented outcomes of
+/// two writers replacing the same file at the same time: the first writer
+/// temporarily renames the destination away, so the second one either cannot
+/// find it or cannot move its own replacement over it. The remaining codes
+/// cover the same window expressed as a sharing or delete-pending state.
+#[cfg(windows)]
+const TRANSIENT_REPLACE_ERRORS: [i32; 6] = [
+    2,    // ERROR_FILE_NOT_FOUND
+    5,    // ERROR_ACCESS_DENIED
+    32,   // ERROR_SHARING_VIOLATION
+    1175, // ERROR_UNABLE_TO_REMOVE_REPLACED
+    1176, // ERROR_UNABLE_TO_MOVE_REPLACEMENT
+    1177, // ERROR_UNABLE_TO_MOVE_REPLACEMENT_2
+];
+
+#[cfg(windows)]
+fn is_transient_replace_error(error: &std::io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| TRANSIENT_REPLACE_ERRORS.contains(&code))
+}
+
+/// Replace the destination file while preserving its Windows security
+/// descriptor.
+///
+/// `ReplaceFileW` keeps the replaced file's ACLs, which is why it is used
+/// instead of a plain rename. It is not safe against concurrent writers of the
+/// same destination: the loser of the race is rejected with a transient
+/// Windows error even though its replacement file is intact. The call is
+/// therefore retried a bounded number of times before the failure is
+/// propagated, so that concurrent writers of the same settings file all
+/// succeed.
 #[cfg(windows)]
 fn replace_settings_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
-    if !destination.exists() {
-        match fs::rename(source, destination) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && destination.exists() => {}
-            Err(error) => return Err(error),
-        }
-    }
+    const MAX_ATTEMPTS: u32 = 25;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
     let destination_wide = destination
         .as_os_str()
         .encode_wide()
@@ -2184,21 +2216,51 @@ fn replace_settings_file(source: &Path, destination: &Path) -> std::io::Result<(
         ) -> i32;
     }
 
-    let replaced = unsafe {
-        replace_file_w(
-            destination_wide.as_ptr(),
-            source_wide.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if replaced == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+    let mut last_error = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(RETRY_DELAY);
+        }
+
+        // The destination is re-checked on every attempt: a concurrent writer
+        // may have replaced it in the meantime, and the check must not be
+        // reused across attempts.
+        if !destination.exists() {
+            match fs::rename(source, destination) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists && destination.exists() => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let replaced = unsafe {
+            replace_file_w(
+                destination_wide.as_ptr(),
+                source_wide.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if replaced != 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+        if !is_transient_replace_error(&error) {
+            return Err(error);
+        }
+        last_error = Some(error);
     }
+
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            io::ErrorKind::Other,
+            "replacing the settings file did not succeed within the retry budget",
+        )
+    }))
 }
 
 fn user_download_directory() -> PathBuf {
@@ -3266,6 +3328,72 @@ mod tests {
         assert_eq!(temporary_paths.len(), 2);
         assert_ne!(temporary_paths[0], temporary_paths[1]);
         assert!(temporary_paths.iter().all(|temporary| !temporary.exists()));
+    }
+
+    /// Replay the Windows replacement race many times.
+    ///
+    /// `ReplaceFileW` rejects the writer that loses the race against a
+    /// concurrent writer of the same destination with a transient Windows
+    /// error, so a single round only exposes the race by luck. The rounds
+    /// here make the rejection deterministic enough to catch a regression of
+    /// the retry budget in `replace_settings_file`.
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_settings_writers_survive_the_windows_replace_race() {
+        const ROUNDS: usize = 200;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, serde_json::to_vec(&Settings::default()).unwrap()).unwrap();
+
+        for round in 0..ROUNDS {
+            let first = Settings {
+                max_concurrent_downloads: 2,
+                default_speed_kib_per_second: 128 + round as u64,
+                global_bandwidth_limit_bytes_per_second: 0,
+                max_download_mib: 1024,
+                max_duration_minutes: 30,
+                max_segments: 1,
+            };
+            let second = Settings {
+                max_concurrent_downloads: 6,
+                default_speed_kib_per_second: 256 + round as u64,
+                global_bandwidth_limit_bytes_per_second: 0,
+                max_download_mib: 3072,
+                max_duration_minutes: 120,
+                max_segments: 1,
+            };
+            let expected_first = serde_json::to_vec_pretty(&first).unwrap();
+            let expected_second = serde_json::to_vec_pretty(&second).unwrap();
+            let start = Arc::new(std::sync::Barrier::new(3));
+            let first_path = path.clone();
+            let second_path = path.clone();
+            let first_start = start.clone();
+            let first_writer = std::thread::spawn(move || {
+                first_start.wait();
+                save_settings_with_replace(&first_path, &first, replace_settings_file).is_ok()
+            });
+            let second_start = start.clone();
+            let second_writer = std::thread::spawn(move || {
+                second_start.wait();
+                save_settings_with_replace(&second_path, &second, replace_settings_file).is_ok()
+            });
+            start.wait();
+
+            assert!(
+                first_writer.join().unwrap(),
+                "round {round} lost the first writer"
+            );
+            assert!(
+                second_writer.join().unwrap(),
+                "round {round} lost the second writer"
+            );
+            let final_settings = std::fs::read(directory.path().join("settings.json")).unwrap();
+            assert!(
+                final_settings == expected_first || final_settings == expected_second,
+                "round {round} wrote an unexpected settings file"
+            );
+        }
     }
 
     #[test]
