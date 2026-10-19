@@ -135,8 +135,7 @@ async fn serve_one(
         && matches!(
             behavior,
             ServerBehavior::WrongContentRange | ServerBehavior::TruncatedFullBody
-        )
-    {
+        ) {
         format!("bytes {}-{end}/{}", start + 1, payload.len())
     } else {
         range_value
@@ -206,7 +205,9 @@ async fn write_truncated_body(stream: &mut TcpStream, body: &[u8]) -> std::io::R
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;
-    stream.write_all(&body[..body.len().saturating_sub(1)]).await
+    stream
+        .write_all(&body[..body.len().saturating_sub(1)])
+        .await
 }
 
 async fn read_request(stream: &mut TcpStream) -> Option<String> {
@@ -516,7 +517,9 @@ async fn truncated_single_stream_fallback_fails_cleanly_and_publishes_no_destina
     assert_no_segment_staging_remainders(directory.path());
     // The single-stream partial stays owned by the session for an in-process
     // resume; the explicit local cleanup releases it.
-    discard_download_session(&session).await.expect("discardable session");
+    discard_download_session(&session)
+        .await
+        .expect("discardable session");
     assert_no_download_temporaries(directory.path());
     server.stop().await;
 }
