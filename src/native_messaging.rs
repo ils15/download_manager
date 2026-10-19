@@ -6,7 +6,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -30,6 +30,23 @@ const CLAIM_MARKER_STALE_AFTER: Duration = Duration::from_secs(600);
 /// inside the fixed directory-entry budget of Windows. The digest form never
 /// ends in `.json.claim`, so it cannot collide with the verbatim form.
 const CLAIM_MARKER_NAME_LIMIT: usize = 64;
+
+/// How many times the removal of an inbox path is retried while the operating
+/// system still holds that path.
+///
+/// Windows closes the handle that blocks a removal outside the process, so a
+/// bounded number of short pauses is enough. The retries never continue
+/// forever: a failure that does not clear is reported after the last attempt.
+const INBOX_CLEANUP_RETRIES: usize = 6;
+
+/// Pause between two removal attempts of the same inbox path.
+const INBOX_CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Upper bound for the whole removal of one inbox path.
+///
+/// The bound keeps a stuck filesystem from holding the caller for longer than
+/// one inbox poll cycle.
+const INBOX_CLEANUP_DEADLINE: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Error)]
 pub enum NativeHostError {
@@ -84,25 +101,25 @@ impl PendingUrlClaim {
 
     /// Acknowledge only after the URL has been accepted by the download queue.
     pub fn acknowledge(self) -> Result<(), NativeHostError> {
-        if let Err(error) = fs::remove_file(&self.claimed_path) {
-            if error.kind() != io::ErrorKind::NotFound {
-                return Err(NativeHostError::InboxClaim {
-                    claim: self.claim_dir.display().to_string(),
-                    cause: error.to_string(),
-                    recovery: format!(
-                        "the queue accepted the URL, but the item remains claimed at {}; do not restore it while the queue is active",
-                        self.claimed_path.display()
-                    ),
-                });
-            }
+        if let Err(error) = remove_inbox_file(&self.claimed_path) {
+            return Err(NativeHostError::InboxClaim {
+                claim: self.claim_dir.display().to_string(),
+                cause: error.to_string(),
+                recovery: format!(
+                    "the queue accepted the URL, but the item remains claimed at {}; do not restore it while the queue is active",
+                    self.claimed_path.display()
+                ),
+            });
         }
-        if let Err(error) = fs::remove_dir(&self.claim_dir) {
-            if error.kind() != io::ErrorKind::NotFound {
-                eprintln!(
-                    "Native Messaging acknowledged an inbox item but could not remove empty claim folder {}: {error}",
+        if let Err(error) = remove_inbox_dir(&self.claim_dir) {
+            return Err(NativeHostError::InboxClaim {
+                claim: self.claim_dir.display().to_string(),
+                cause: error.to_string(),
+                recovery: format!(
+                    "the queue accepted the URL, but the empty claim folder remains at {}; it can be removed once every instance is closed",
                     self.claim_dir.display()
-                );
-            }
+                ),
+            });
         }
         Ok(())
     }
@@ -117,6 +134,106 @@ impl PendingUrlClaim {
             },
         )
     }
+}
+
+/// Reports whether a filesystem failure is a transient Windows condition.
+///
+/// Windows reports a path that another handle still holds as
+/// `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32) or
+/// `ERROR_LOCK_VIOLATION` (33), and a directory whose child entry is still
+/// delete-pending as `ERROR_DIR_NOT_EMPTY` (145). Every one of them clears on
+/// its own once the blocking handle is closed.
+///
+/// The raw codes are Windows specific, so a Unix failure never matches them:
+/// the Unix behaviour stays exactly as it was and a genuine Unix failure is
+/// reported without a retry.
+fn is_transient_windows_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(5) | Some(32) | Some(33) | Some(145)
+    )
+}
+
+/// Reports whether a removed path is really gone.
+///
+/// A Windows path whose last handle is still closing answers with a
+/// permission error instead of "not found", so that answer counts as gone:
+/// the operating system already accepted the removal.
+fn removal_is_confirmed(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) if is_transient_windows_error(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes one inbox path, retrying while the operating system still holds it.
+///
+/// The removal is idempotent: a path that is already gone is reported as
+/// `Ok(false)` instead of an error, so a repeated cleanup never fails.
+/// `Ok(true)` means that this call removed the path.
+///
+/// A removal is only reported as complete once the path is confirmed gone. A
+/// failure that does not clear is reported after a bounded number of attempts
+/// and after the total time bound, so the caller is never blocked forever.
+///
+/// `remove` and `pause` are injected so that the retry can be exercised
+/// deterministically, without depending on the operating system and without a
+/// real pause.
+fn remove_inbox_path_with(
+    path: &Path,
+    mut remove: impl FnMut(&Path) -> io::Result<()>,
+    mut pause: impl FnMut(Duration),
+) -> io::Result<bool> {
+    let deadline = Instant::now() + INBOX_CLEANUP_DEADLINE;
+    let mut attempts = 0usize;
+    let mut last_error = None;
+    loop {
+        match remove(path) {
+            // A removal only counts as complete once the path is gone.
+            Ok(()) => {
+                if removal_is_confirmed(path)? {
+                    return Ok(true);
+                }
+            }
+            // The path is already gone, so the removal is complete.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            // A genuine failure, such as a real permission problem or an
+            // invalid path, is reported without a retry.
+            Err(error) if !is_transient_windows_error(&error) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+        attempts += 1;
+        if attempts > INBOX_CLEANUP_RETRIES || Instant::now() >= deadline {
+            let error = last_error.unwrap_or_else(|| {
+                io::Error::other(format!("the path was not removed: {}", path.display()))
+            });
+            return Err(error);
+        }
+        pause(INBOX_CLEANUP_RETRY_DELAY);
+    }
+}
+
+/// Removes one inbox file, retrying while the operating system still holds it.
+fn remove_inbox_file(path: &Path) -> io::Result<bool> {
+    remove_inbox_path_with(path, remove_file_entry, std::thread::sleep)
+}
+
+/// Removes one empty inbox directory, retrying while the operating system
+/// still holds it.
+fn remove_inbox_dir(path: &Path) -> io::Result<bool> {
+    remove_inbox_path_with(path, remove_dir_entry, std::thread::sleep)
+}
+
+/// `fs::remove_file` with the argument type that the retry helper expects.
+fn remove_file_entry(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+/// `fs::remove_dir` with the argument type that the retry helper expects.
+fn remove_dir_entry(path: &Path) -> io::Result<()> {
+    fs::remove_dir(path)
 }
 
 #[derive(Debug, Serialize)]
@@ -261,11 +378,9 @@ fn claim_next_pending_url_with(
             // the inbox. A source that can no longer be inspected proves
             // that another consumer won the race, so the item is skipped.
             let mut recovery = Vec::new();
-            if let Err(cleanup_error) = fs::remove_dir(&claim_dir) {
-                if cleanup_error.kind() != io::ErrorKind::NotFound {
-                    let detail = format!("claim folder cleanup failed: {cleanup_error}");
-                    recovery.push(detail);
-                }
+            if let Err(cleanup_error) = remove_inbox_dir(&claim_dir) {
+                let detail = format!("claim folder cleanup failed: {cleanup_error}");
+                recovery.push(detail);
             }
             if let Err(release_error) = release_claim_marker(&marker) {
                 let detail = format!("claim marker release failed: {release_error}");
@@ -437,25 +552,35 @@ struct ClaimMarker {
 fn acquire_claim_marker(inbox: &Path, item: &Path) -> io::Result<Option<ClaimMarker>> {
     let marker_path = claim_marker_path(inbox, item);
     match create_claim_marker(&marker_path) {
-        Ok(marker) => Ok(Some(marker)),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            if !claim_marker_is_stale(&marker_path)? {
-                return Ok(None);
-            }
-            // Crash residue: the previous owner died without releasing the
-            // marker. The recovery runs once per item and per poll cycle, so
-            // two consumers cannot loop against each other.
-            match fs::remove_file(&marker_path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error),
-            }
-            match create_claim_marker(&marker_path) {
-                Ok(marker) => Ok(Some(marker)),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-                Err(error) => Err(error),
-            }
+        Ok(marker) => return Ok(Some(marker)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) if is_transient_windows_error(&error) => {
+            // Windows reports a marker that another consumer is creating or
+            // releasing right now as ERROR_ACCESS_DENIED instead of
+            // ERROR_FILE_EXISTS. The item belongs to that consumer, so it is
+            // skipped and claimed by a later poll cycle instead of being
+            // reported as a failure.
+            return Ok(None);
         }
+        Err(error) => return Err(error),
+    }
+    // Crash residue: the previous owner died without releasing the
+    // marker. The recovery runs once per item and per poll cycle, so
+    // two consumers cannot loop against each other.
+    if !claim_marker_is_stale(&marker_path)? {
+        return Ok(None);
+    }
+    match remove_inbox_file(&marker_path) {
+        Ok(true) => {}
+        // The marker is already gone, so the item is left to the consumer
+        // that claims it next.
+        Ok(false) => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    match create_claim_marker(&marker_path) {
+        Ok(marker) => Ok(Some(marker)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+        Err(error) if is_transient_windows_error(&error) => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -477,7 +602,7 @@ fn create_claim_marker(marker_path: &Path) -> io::Result<ClaimMarker> {
     let write_result = file.write_all(token.as_bytes());
     drop(file);
     if let Err(error) = write_result {
-        let _ = fs::remove_file(marker_path);
+        let _ = remove_inbox_file(marker_path);
         return Err(error);
     }
     Ok(ClaimMarker {
@@ -495,6 +620,12 @@ fn claim_marker_is_stale(marker_path: &Path) -> io::Result<bool> {
     let metadata = match fs::symlink_metadata(marker_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if is_transient_windows_error(&error) => {
+            // Windows reports a marker that another consumer is releasing
+            // right now as ERROR_ACCESS_DENIED. The marker is not crash
+            // residue, so the item still belongs to that consumer.
+            return Ok(false);
+        }
         Err(error) => return Err(error),
     };
     let Ok(modified) = metadata.modified() else {
@@ -528,11 +659,8 @@ fn release_claim_marker(marker: &ClaimMarker) -> io::Result<bool> {
     if content != marker.token.as_bytes() {
         return Ok(false);
     }
-    match fs::remove_file(&marker.path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
+    // A marker that is already gone is not owned by this consumer any more.
+    remove_inbox_file(&marker.path)
 }
 
 /// Derive the deterministic claim-marker path of one inbox item.
@@ -627,7 +755,7 @@ fn quarantine_claim(
     })?;
     let quarantine_path = quarantine_dir.join("message.json");
     if let Err(error) = fs::rename(claimed_path, &quarantine_path) {
-        let _ = fs::remove_dir(&quarantine_dir);
+        let _ = remove_inbox_dir(&quarantine_dir);
         return Err(NativeHostError::InboxClaim {
             claim: claim_dir.display().to_string(),
             cause: error.to_string(),
@@ -637,14 +765,12 @@ fn quarantine_claim(
             ),
         });
     }
-    if let Err(error) = fs::remove_dir(claim_dir) {
-        if error.kind() != io::ErrorKind::NotFound {
-            eprintln!(
-                "Native Messaging quarantined an invalid item at {} but could not remove empty claim folder {}: {error}",
-                quarantine_path.display(),
-                claim_dir.display()
-            );
-        }
+    if let Err(error) = remove_inbox_dir(claim_dir) {
+        eprintln!(
+            "Native Messaging quarantined an invalid item at {} but could not remove empty claim folder {}: {error}",
+            quarantine_path.display(),
+            claim_dir.display()
+        );
     }
     Ok(quarantine_path)
 }
@@ -677,9 +803,8 @@ fn restore_claim_paths(
             claimed_path.display()
         )
     })?;
-    match fs::remove_dir(claim_dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+    match remove_inbox_dir(claim_dir) {
+        Ok(_) => Ok(()),
         Err(error) => Err(format!(
             "the item was restored to incoming, but the empty claim folder remains at {}: {error}",
             claim_dir.display()
@@ -1071,7 +1196,13 @@ mod tests {
 
         // Every item is delivered exactly once: no URL is queued twice.
         assert_eq!(delivered, expected);
-        assert_eq!(fs::read_dir(data_dir.join("incoming")).unwrap().count(), 0);
+        // Nothing outlives a claim: no inbox item, no claim marker and no
+        // orphan claim folder.
+        let leftovers = inbox_leftovers(&data_dir);
+        assert!(
+            leftovers.is_empty(),
+            "the inbox kept entries: {leftovers:?}"
+        );
     }
 
     /// Replay the Windows double-claim race many times.
@@ -1080,6 +1211,11 @@ mod tests {
     /// so a single round exposes the race only by luck. The rounds make the
     /// double claim deterministic enough to catch a regression of the
     /// exclusive claim marker.
+    ///
+    /// The round asserts the property that matters and nothing else: the
+    /// item is claimed exactly once and the inbox is left without a single
+    /// entry. A leftover entry names the kind of leftover, so a failure does
+    /// not depend on the order in which the consumers happened to run.
     #[cfg(windows)]
     #[test]
     fn concurrent_consumers_never_claim_one_item_twice_on_windows() {
@@ -1119,11 +1255,36 @@ mod tests {
             for consumer in consumers {
                 delivered.extend(consumer.join().unwrap());
             }
-            let remaining = fs::read_dir(&inbox).unwrap().count();
-            assert_eq!(delivered.len(), 1, "round {round} claimed the item twice");
-            assert_eq!(delivered, vec![url]);
-            assert_eq!(remaining, 0, "round {round} left inbox entries behind");
+            // The item is claimed exactly once, by exactly one consumer.
+            assert_eq!(
+                delivered,
+                vec![url],
+                "round {round} did not claim the item once"
+            );
+            // No orphan claim folder outlives the claim.
+            let orphan_folders = processing_claim_folder_count(&data_dir);
+            assert_eq!(
+                orphan_folders, 0,
+                "round {round} left an orphan claim folder"
+            );
+            // Nothing outlives the claim: no inbox item, no claim marker and
+            // no orphan claim folder.
+            let leftovers = inbox_leftovers(&data_dir);
+            assert!(
+                leftovers.is_empty(),
+                "round {round} left entries: {leftovers:?}"
+            );
         }
+    }
+
+    /// Names of the inbox entries that outlived a claim.
+    fn inbox_leftovers(data_dir: &Path) -> Vec<String> {
+        let mut leftovers = Vec::new();
+        for entry in fs::read_dir(data_dir.join("incoming")).unwrap().flatten() {
+            leftovers.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        leftovers.sort();
+        leftovers
     }
 
     #[test]
@@ -1236,6 +1397,141 @@ mod tests {
         // maps to a different one.
         assert_eq!(marker, claim_marker_path(inbox, &long_item));
         assert_ne!(marker, claim_marker_path(inbox, &inbox.join("other.json")));
+    }
+
+    /// The retry of a removal is exercised without the operating system and
+    /// without a real pause: the removal is injected, so the first attempt can
+    /// fail with a transient Windows code while the second one succeeds.
+    #[test]
+    fn a_transient_removal_failure_is_retried_until_the_path_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("message.json");
+        let mut attempts = 0usize;
+        let mut pauses = Vec::new();
+        let remove = |_entry: &Path| -> io::Result<()> {
+            attempts += 1;
+            if attempts == 1 {
+                // Windows reports a directory whose child entry is still
+                // delete-pending as ERROR_DIR_NOT_EMPTY.
+                Err(io::Error::from_raw_os_error(145))
+            } else {
+                Ok(())
+            }
+        };
+        let pause = |delay: Duration| pauses.push(delay);
+
+        let outcome = remove_inbox_path_with(&path, remove, pause);
+
+        assert!(outcome.unwrap(), "the removal must be reported as complete");
+        assert_eq!(attempts, 2, "the transient failure must be retried once");
+        assert_eq!(pauses, vec![INBOX_CLEANUP_RETRY_DELAY]);
+    }
+
+    #[test]
+    fn a_genuine_removal_failure_is_reported_without_a_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("message.json");
+        let mut attempts = 0usize;
+        let mut pauses = 0usize;
+        let remove = |_entry: &Path| -> io::Result<()> {
+            attempts += 1;
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a removable entry",
+            ))
+        };
+        let pause = |_delay: Duration| pauses += 1;
+
+        let error = remove_inbox_path_with(&path, remove, pause).unwrap_err();
+
+        assert!(error.to_string().contains("not a removable entry"));
+        assert_eq!(attempts, 1, "a genuine failure must not be retried");
+        assert_eq!(pauses, 0, "a genuine failure must not pause");
+    }
+
+    #[test]
+    fn a_removal_that_never_clears_stops_after_a_bounded_number_of_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("message.json");
+        let mut attempts = 0usize;
+        let remove = |_entry: &Path| -> io::Result<()> {
+            attempts += 1;
+            // Windows reports a path that another handle still holds as
+            // ERROR_ACCESS_DENIED.
+            Err(io::Error::from_raw_os_error(5))
+        };
+        let pause = |_delay: Duration| {};
+
+        let error = remove_inbox_path_with(&path, remove, pause).unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(
+            attempts,
+            INBOX_CLEANUP_RETRIES + 1,
+            "the retry must be bounded"
+        );
+    }
+
+    #[test]
+    fn removing_an_absent_inbox_path_is_not_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("message.json");
+        let mut attempts = 0usize;
+        let remove = |_entry: &Path| -> io::Result<()> {
+            attempts += 1;
+            Err(io::Error::new(io::ErrorKind::NotFound, "already removed"))
+        };
+        let pause = |_delay: Duration| {};
+
+        let outcome = remove_inbox_path_with(&path, remove, pause);
+
+        assert!(
+            !outcome.unwrap(),
+            "an absent path was not removed by this call"
+        );
+        assert_eq!(attempts, 1, "an absent path must not be retried");
+    }
+
+    #[test]
+    fn a_removal_that_reports_success_without_removing_the_path_is_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("message.json");
+        fs::write(&path, b"still there").unwrap();
+        let mut attempts = 0usize;
+        let remove = |entry: &Path| -> io::Result<()> {
+            attempts += 1;
+            if attempts == 1 {
+                // The operating system accepted the removal, but the entry is
+                // still visible, so the removal is not complete yet.
+                Ok(())
+            } else {
+                fs::remove_file(entry)
+            }
+        };
+        let pause = |_delay: Duration| {};
+
+        let outcome = remove_inbox_path_with(&path, remove, pause);
+
+        assert!(outcome.unwrap(), "the removal must be reported as complete");
+        assert_eq!(attempts, 2, "an unconfirmed removal must be retried");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn only_the_windows_busy_codes_are_treated_as_transient() {
+        for code in [5, 32, 33, 145] {
+            let busy = io::Error::from_raw_os_error(code);
+            assert!(
+                is_transient_windows_error(&busy),
+                "the code {code} must be retried"
+            );
+        }
+        let genuine = io::Error::new(io::ErrorKind::InvalidInput, "genuine failure");
+        assert!(!is_transient_windows_error(&genuine));
+        // A Unix failure carries a Unix code, so it is never mistaken for a
+        // busy Windows path and is reported without a retry.
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "genuine denial");
+        assert!(!is_transient_windows_error(&denied));
     }
 
     fn inbox_item_path(data_dir: &Path) -> PathBuf {
