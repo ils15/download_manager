@@ -1,6 +1,7 @@
 /target/
 /artifacts/
 /installer-output/
+/dist/
 *.exe
 *.pdb
 *.log
