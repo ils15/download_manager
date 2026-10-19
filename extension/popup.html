@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Send a download</title>
+    <style>
+      body { box-sizing: border-box; width: 300px; margin: 0; padding: 18px; background: #121820; color: #f4f7fb; font: 14px system-ui, sans-serif; }
+      p { color: #b9c5d0; line-height: 1.45; }
+      button { width: 100%; min-height: 42px; border: 0; border-radius: 8px; background: #70d6c1; color: #10201d; font-weight: 700; cursor: pointer; }
+      #status { min-height: 20px; overflow-wrap: anywhere; }
+    </style>
+  </head>
+  <body>
+    <h1>Send a download</h1>
+    <p>The active tab URL is sent only when you press this button. Browser cookies and page contents are never read; URLs with common embedded auth tokens are rejected.</p>
+    <button id="send">Send this tab URL</button>
+    <p id="status" role="status" aria-live="polite"></p>
+    <script src="popup.js"></script>
+  </body>
+</html>

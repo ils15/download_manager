@@ -1,0 +1,311 @@
+import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+
+export struct JobRow {
+    id: string,
+    details: string,
+    priority: string,
+    can_set_priority: bool,
+    can_pause: bool,
+    can_resume: bool,
+    can_cancel: bool,
+}
+
+export struct HistoryRow {
+    details: string,
+}
+
+export component MainWindow inherits Window {
+    title: "Independent Download Manager";
+    width: 920px;
+    height: 980px;
+    background: #121820;
+
+    in-out property <string> status: "Ready";
+    in-out property <[JobRow]> jobs: [];
+    in-out property <string> selected_job_id: "";
+    in-out property <bool> selected_job_can_set_priority: false;
+    in-out property <string> max_active: "3";
+    in-out property <string> speed_limit: "0";
+    in-out property <string> global_bandwidth_limit: "0";
+    in-out property <string> max_download_mib: "4096";
+    in-out property <string> max_duration_minutes: "360";
+    in-out property <string> max_segments: "1";
+    in-out property <[HistoryRow]> history: [];
+    in-out property <string> in_app_notification: "";
+    in-out property <string> progress_announcement: "";
+    in-out property <bool> has_pending_cleanup: false;
+    in-out property <bool> cleanup_retry_in_progress: false;
+    callback add_url(string, string, bool, string, string);
+    callback job_action(string, string);
+    callback set_job_priority(string, string);
+    callback save_limits(string, string, string, string, string, string);
+    callback retry_pending_cleanup();
+    callback clear_history();
+    callback dismiss_notification();
+
+    VerticalLayout {
+        padding: 28px;
+        spacing: 18px;
+
+        Text {
+            text: "Downloads";
+            color: #f4f7fb;
+            font-size: 30px;
+            font-weight: 700;
+        }
+        Text {
+            text: "Independent HTTP(S) transfers — URLs are used only after you add them.";
+            color: #aab7c5;
+            font-size: 14px;
+        }
+        Text {
+            text: "Manual URL (Ctrl+V to paste explicitly)";
+            color: #c4cfda;
+            font-size: 13px;
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            url_entry := LineEdit {
+                placeholder-text: "https://example.org/file.zip";
+                accessible-label: "Manual URL; Ctrl+V to paste explicitly";
+                min-height: 44px;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "Add download";
+                clicked => {
+                    root.add_url(
+                        url_entry.text,
+                        expected_hash_entry.text,
+                        schedule_toggle.checked,
+                        schedule_start_entry.text,
+                        schedule_end_entry.text
+                    );
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            Text { text: "Expected staging SHA-256 (optional)"; color: #c4cfda; vertical-alignment: center; }
+            expected_hash_entry := LineEdit {
+                placeholder-text: "64 hex characters, no spaces; blank disables verification";
+                horizontal-stretch: 1;
+            }
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            schedule_toggle := CheckBox { text: "Schedule in UTC"; checked: false; }
+            Text { text: "Window (24-hour HH:MM):"; color: #c4cfda; vertical-alignment: center; }
+            schedule_start_entry := LineEdit { text: "09:00"; width: 90px; }
+            Text { text: "to"; color: #c4cfda; vertical-alignment: center; }
+            schedule_end_entry := LineEdit { text: "17:00"; width: 90px; }
+            Text { text: "UTC"; color: #c4cfda; vertical-alignment: center; }
+        }
+        Text {
+            text: "Clipboard is accessed only on your Ctrl+V gesture; it is never monitored.";
+            color: #8996a4;
+            font-size: 12px;
+        }
+        Text {
+            text: "Equal start/end times mean all day; overnight windows are supported.";
+            color: #8996a4;
+            font-size: 12px;
+        }
+
+        Rectangle {
+            background: #1d2733;
+            border-radius: 12px;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                Text { text: "Transfer limits"; color: #f4f7fb; font-size: 17px; font-weight: 600; }
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: "Concurrent downloads per instance (1–8; restart to apply)"; color: #c4cfda; vertical-alignment: center; }
+                        active_entry := LineEdit { text: root.max_active; input-type: number; width: 70px; }
+                        Text { text: "Maximum segments (1–4; default 1)"; color: #c4cfda; vertical-alignment: center; }
+                        max_segments_entry := LineEdit { text: root.max_segments; input-type: number; width: 60px; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: "Per-download speed cap (KB/s; 0 = unlimited)"; color: #c4cfda; vertical-alignment: center; }
+                        speed_entry := LineEdit { text: root.speed_limit; input-type: number; width: 90px; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: "Average application-level byte pacing per instance (bytes/s; 0 = unlimited)"; color: #c4cfda; vertical-alignment: center; }
+                        global_bandwidth_entry := LineEdit { text: root.global_bandwidth_limit; input-type: number; width: 120px; }
+                    }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: "Max size per download (MiB)"; color: #c4cfda; vertical-alignment: center; }
+                        max_size_entry := LineEdit { text: root.max_download_mib; input-type: number; width: 100px; }
+                        Text { text: "Absolute duration (minutes)"; color: #c4cfda; vertical-alignment: center; }
+                        max_duration_entry := LineEdit { text: root.max_duration_minutes; input-type: number; width: 80px; }
+                        Button {
+                            text: "Save";
+                            clicked => { root.save_limits(active_entry.text, speed_entry.text, global_bandwidth_entry.text, max_size_entry.text, max_duration_entry.text, max_segments_entry.text); }
+                        }
+                    }
+                }
+                Text {
+                    text: "Application-level average pacing, not an instantaneous wire cap. Each active HTTP stream may hold one 16 KiB reservation; the instance-wide connection quota bounds aggregate reservations. The shared bucket may hold another 16 KiB, and each stream may retain one transport-sized chunk. Client/OS buffering is outside this bound; instances are not coordinated.";
+                    color: #8996a4;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Segments are attempted only for files at least 8 MiB after a strict Range/Content-Length/strong-ETag probe. Every connection consumes one slot from the instance-wide concurrent-download quota; unsupported or inconsistent range responses are cleaned and retried as one stream.";
+                    color: #8996a4;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.in_app_notification;
+                visible: root.in_app_notification != "";
+                color: #f0c674;
+                font-size: 14px;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                accessible-role: text;
+                accessible-label: root.in_app_notification;
+                accessible-live-region: polite;
+            }
+            Button {
+                text: "Dismiss notification";
+                visible: root.in_app_notification != "";
+                clicked => { root.dismiss_notification(); }
+            }
+        }
+        Text { text: root.status; color: #70d6c1; font-size: 14px; }
+        Text {
+            text: root.progress_announcement;
+            visible: root.progress_announcement != "";
+            color: #aab7c5;
+            font-size: 12px;
+            wrap: word-wrap;
+            accessible-role: text;
+            accessible-label: root.progress_announcement;
+            accessible-live-region: polite;
+        }
+        Text { text: "Queue"; color: #f4f7fb; font-size: 20px; font-weight: 600; }
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Priority for selected job";
+                color: #c4cfda;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "High";
+                enabled: root.selected_job_id != "" && root.selected_job_can_set_priority;
+                clicked => { root.set_job_priority(root.selected_job_id, "High"); }
+            }
+            Button {
+                text: "Normal";
+                enabled: root.selected_job_id != "" && root.selected_job_can_set_priority;
+                clicked => { root.set_job_priority(root.selected_job_id, "Normal"); }
+            }
+            Button {
+                text: "Low";
+                enabled: root.selected_job_id != "" && root.selected_job_can_set_priority;
+                clicked => { root.set_job_priority(root.selected_job_id, "Low"); }
+            }
+        }
+        Text {
+            text: "Higher priority runs first among permit waiters; equal priorities are FIFO. Active downloads are not interrupted. Sustained High traffic can defer Low jobs.";
+            color: #8996a4;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+        Button {
+            text: root.cleanup_retry_in_progress ? "Retrying cleanup…" : "Retry pending cleanup";
+            enabled: root.has_pending_cleanup && !root.cleanup_retry_in_progress;
+            clicked => { root.retry_pending_cleanup(); }
+        }
+        ScrollView {
+            VerticalLayout {
+                spacing: 7px;
+                for item in root.jobs: Rectangle {
+                    background: #1d2733;
+                    border-radius: 8px;
+                    min-height: 54px;
+                    HorizontalLayout {
+                        padding: 8px;
+                        spacing: 7px;
+                        Text {
+                            text: item.details + " · Priority " + item.priority;
+                            accessible-role: text;
+                            accessible-label: item.details + " · Priority " + item.priority;
+                            color: #d3dce5;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Button {
+                            text: root.selected_job_id == item.id ? "Selected" : "Select";
+                            clicked => {
+                                root.selected_job_id = item.id;
+                                root.selected_job_can_set_priority = item.can_set_priority;
+                            }
+                        }
+                        Button {
+                            text: "Pause";
+                            enabled: item.can_pause;
+                            clicked => { root.job_action(item.id, "pause"); }
+                        }
+                        Button {
+                            text: "Resume";
+                            enabled: item.can_resume;
+                            clicked => { root.job_action(item.id, "resume"); }
+                        }
+                        Button {
+                            text: "Cancel";
+                            enabled: item.can_cancel;
+                            clicked => { root.job_action(item.id, "cancel"); }
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            Text { text: "History"; color: #f4f7fb; font-size: 20px; font-weight: 600; horizontal-stretch: 1; }
+            Button { text: "Clear history"; clicked => { root.clear_history(); } }
+        }
+        Text {
+            text: "History is saved automatically (up to 500 entries); URL query and fragment values are omitted.";
+            color: #8996a4;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+        ScrollView {
+            height: 145px;
+            VerticalLayout {
+                spacing: 5px;
+                for item in root.history: Text {
+                    text: item.details;
+                    color: #c4cfda;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        Text {
+            text: "Progress is per job. ETA is approximate and appears only with a validated total and stable measured speed; unknown-length transfers show bytes without ETA. It resets while resuming and stays fixed while paused. SHA-256 covers the staging handle, not local writers racing the pathname commit; re-hash the destination for adversarial integrity. No cookies, credentials, browser session data, or DRM circumvention; redirects are not followed.";
+            color: #8996a4;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+    }
+}

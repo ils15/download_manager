@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Independent Download Manager — explicit send",
+  "version": "0.1.0",
+  "description": "Send the active HTTP(S) tab URL to the local download manager only after a click.",
+  "permissions": ["activeTab", "nativeMessaging"],
+  "action": {
+    "default_title": "Send current tab to Download Manager",
+    "default_popup": "popup.html"
+  }
+}

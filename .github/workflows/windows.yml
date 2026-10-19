@@ -1,0 +1,90 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    strategy:
+      matrix:
+        rust: ["1.92.0", "1.99.1"]
+    steps:
+      # actions/checkout v4.4.0; immutable SHA (GitHub-verified commit).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      # Immutable action commit; matrix checks the declared MSRV and current toolchain.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "${{ matrix.rust }}"
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets
+      - name: Build Windows x64 release
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - name: Install pinned Inno Setup 7.1.0
+        if: matrix.rust == '1.99.1'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installerPath = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.0-x64.exe'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -OutFile $installerPath
+
+          $expectedHash = '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f'
+          $actualHash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw "Inno Setup SHA-256 mismatch: expected $expectedHash, got $actualHash"
+          }
+
+          $process = Start-Process -FilePath $installerPath -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/DIR=C:\InnoSetup\7.1.0'
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Inno Setup installation failed with exit code $($process.ExitCode)"
+          }
+          if (-not (Test-Path 'C:\InnoSetup\7.1.0\ISCC.exe')) {
+            throw 'Pinned Inno Setup installation did not provide ISCC.exe at the expected path.'
+          }
+      - name: Compile installer template (valid Chrome extension ID supplied; unpacked dev or Store)
+        if: matrix.rust == '1.99.1'
+        shell: pwsh
+        run: |
+          & 'C:\InnoSetup\7.1.0\ISCC.exe' 'installer.iss'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compiler failed with exit code $LASTEXITCODE"
+          }
+      - name: Upload installer template (valid Chrome extension ID supplied; unpacked dev or Store)
+        if: matrix.rust == '1.99.1'
+        # actions/upload-artifact v4.6.2; immutable SHA (GitHub-verified commit).
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: independent-download-manager-windows-x64-${{ github.run_number }}-attempt-${{ github.run_attempt }}-installer-template-nonfunctional-rust-${{ matrix.rust }}
+          if-no-files-found: error
+          path: setup-independent-download-manager.exe
+      - name: Upload release executable
+        # actions/upload-artifact v4.6.2; immutable SHA (GitHub-verified commit).
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: independent-download-manager-windows-x64-${{ github.run_number }}-attempt-${{ github.run_attempt }}-rust-${{ matrix.rust }}-exe
+          if-no-files-found: error
+          path: target/x86_64-pc-windows-msvc/release/independent-download-manager.exe
+      - name: Upload Chrome extension artifacts
+        # Same immutable upload-artifact pin; extension files are a separate required artifact group.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: independent-download-manager-windows-x64-${{ github.run_number }}-attempt-${{ github.run_attempt }}-rust-${{ matrix.rust }}-extension
+          if-no-files-found: error
+          path: |
+            extension/manifest.json
+            extension/popup.html
+            extension/popup.js

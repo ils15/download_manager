@@ -1,0 +1,33 @@
+/target/
+/artifacts/
+/installer-output/
+*.exe
+*.pdb
+*.log
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+
+# Local agent and editor state
+/.opencode/
+/native-host.json
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Signing material and generated packaging
+*.pfx
+*.p12
+*.sig
+
+# Partial and packaged downloads
+*.part
+*.crdownload
+*.download
+*.zip
+*.7z
+*.iso
+*.apk
