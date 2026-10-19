@@ -184,6 +184,18 @@ fn publish_inbox_message(inbox: &Path, message: &IncomingMessage) -> Result<(), 
 }
 
 pub fn claim_next_pending_url(data_dir: &Path) -> Result<Option<PendingUrlClaim>, NativeHostError> {
+    claim_next_pending_url_with(data_dir, |from, to| fs::rename(from, to))
+}
+
+/// Claim the next inbox item with a winner-take-rename.
+///
+/// `rename` is injected so the losing side of the race can be reproduced
+/// deterministically in tests; production always uses the standard library
+/// rename.
+fn claim_next_pending_url_with(
+    data_dir: &Path,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<Option<PendingUrlClaim>, NativeHostError> {
     let inbox = data_dir.join("incoming");
     let entries = match fs::read_dir(&inbox) {
         Ok(entries) => entries,
@@ -203,26 +215,47 @@ pub fn claim_next_pending_url(data_dir: &Path) -> Result<Option<PendingUrlClaim>
         // subsequent same-volume rename gives exactly one consumer the item.
         let claim_dir = create_claim_directory(&inbox)?;
         let claimed_path = claim_dir.join("message.json");
-        if let Err(error) = fs::rename(&path, &claimed_path) {
-            match fs::remove_dir(&claim_dir) {
-                Ok(()) if error.kind() == io::ErrorKind::NotFound => continue,
-                Ok(()) => return Err(error.into()),
-                Err(cleanup_error) if error.kind() == io::ErrorKind::NotFound => {
+        if let Err(error) = rename(&path, &claimed_path) {
+            // The winner-take-rename reports a lost race differently per
+            // platform: POSIX answers NotFound, while Windows answers
+            // ERROR_ACCESS_DENIED because the source name was already taken by
+            // the winning consumer. Only a source that is no longer claimable
+            // proves that another consumer won, so the source is inspected
+            // exactly once. A source that is still there means the failure is
+            // genuine (a real permission problem or a persistent sharing
+            // violation) and is propagated with the item left untouched in the
+            // inbox.
+            let cleanup = fs::remove_dir(&claim_dir);
+            let taken_by_other_consumer = source_is_no_longer_claimable(&path);
+            match cleanup {
+                Ok(()) => {
+                    if taken_by_other_consumer {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {
+                    if taken_by_other_consumer {
+                        continue;
+                    }
                     return Err(NativeHostError::InboxClaim {
                         claim: claim_dir.display().to_string(),
                         cause: error.to_string(),
                         recovery: format!(
-                            "the source was already claimed, but the empty claim directory could not be removed: {cleanup_error}"
+                            "the source is still in the inbox, but the empty claim directory could not be removed: {cleanup_error}"
                         ),
                     });
                 }
                 Err(cleanup_error) => {
+                    let recovery = if taken_by_other_consumer {
+                        "the source was already claimed by another consumer, but the empty claim directory could not be removed"
+                    } else {
+                        "the source is still in the inbox and the empty claim directory could not be removed"
+                    };
                     return Err(NativeHostError::InboxClaim {
                         claim: claim_dir.display().to_string(),
                         cause: error.to_string(),
-                        recovery: format!(
-                            "the source was not claimed and the empty claim directory could not be removed: {cleanup_error}"
-                        ),
+                        recovery: format!("{recovery}: {cleanup_error}"),
                     });
                 }
             }
@@ -300,6 +333,25 @@ pub fn claim_next_pending_url(data_dir: &Path) -> Result<Option<PendingUrlClaim>
         }));
     }
     Ok(None)
+}
+
+/// Report whether the source item is no longer a claimable inbox file.
+///
+/// The rename already failed, so the source is inspected exactly once. A source
+/// that can no longer be inspected is not claimable any more: POSIX reports
+/// NotFound once the winning consumer moved the file away, and Windows reports
+/// ERROR_ACCESS_DENIED while the winning consumer holds that file open for the
+/// same rename (STATUS_DELETE_PENDING). A source that can still be inspected is
+/// a live inbox item, so the failure was genuine and has to be propagated with
+/// the item left untouched in the inbox.
+fn source_is_no_longer_claimable(source: &Path) -> bool {
+    match fs::symlink_metadata(source) {
+        Ok(_) => false,
+        Err(error) => matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        ),
+    }
 }
 
 fn create_claim_directory(inbox: &Path) -> io::Result<PathBuf> {
@@ -603,6 +655,117 @@ mod tests {
         assert!(error.to_string().contains("restored for a later retry"));
         assert_eq!(fs::read(original).unwrap(), contents);
         assert!(!claim_dir.exists());
+    }
+
+    #[test]
+    fn a_consumer_that_lost_the_rename_race_reports_nothing_and_keeps_the_item_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().to_path_buf();
+        accept_message(
+            &data_dir,
+            br#"{"action":"download","url":"https://example.com/raced"}"#,
+        )
+        .unwrap();
+
+        // The winning consumer takes the item first, so the loser's rename
+        // fails the way Windows reports it (ERROR_ACCESS_DENIED) instead of the
+        // POSIX NotFound.
+        let winner_claim = directory.path().join("winner-claim");
+        fs::create_dir_all(&winner_claim).unwrap();
+        let winner_target = winner_claim.join("message.json");
+        let rename_target = winner_target.clone();
+        let rename = move |from: &Path, _to: &Path| -> io::Result<()> {
+            fs::rename(from, &rename_target)?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated ERROR_ACCESS_DENIED",
+            ))
+        };
+
+        let claim = claim_next_pending_url_with(&data_dir, rename).unwrap();
+        assert!(claim.is_none());
+        // The item stays recoverable in the winning consumer's claim folder,
+        // and the losing consumer left no empty claim folder behind.
+        assert!(winner_target.exists());
+        assert_eq!(processing_claim_folder_count(&data_dir), 0);
+    }
+
+    #[test]
+    fn a_claim_failure_with_the_item_still_in_the_inbox_propagates_the_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().to_path_buf();
+        accept_message(
+            &data_dir,
+            br#"{"action":"download","url":"https://example.com/kept"}"#,
+        )
+        .unwrap();
+
+        // A real permission problem or a persistent sharing violation leaves
+        // the item in the inbox, so it has to be reported instead of being
+        // mistaken for a lost race.
+        let rename = |_from: &Path, _to: &Path| -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "simulated sharing violation",
+            ))
+        };
+
+        let error = claim_next_pending_url_with(&data_dir, rename).unwrap_err();
+        assert!(matches!(&error, NativeHostError::Io(_)));
+        assert!(error.to_string().contains("simulated sharing violation"));
+        // The item is untouched and remains recoverable in the inbox.
+        assert_eq!(inbox_item_count(&data_dir), 1);
+        assert_eq!(processing_claim_folder_count(&data_dir), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inaccessible_inbox_reports_the_permission_error_instead_of_reporting_nothing() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().to_path_buf();
+        let inbox = data_dir.join("incoming");
+        fs::create_dir_all(&inbox).unwrap();
+        let message = br#"{"action":"download","url":"https://example.com/kept"}"#;
+        fs::write(inbox.join("001.json"), message).unwrap();
+        if fs::metadata(&inbox).unwrap().uid() == 0 {
+            // Root bypasses directory permissions, so the failure cannot be
+            // provoked here.
+            return;
+        }
+        fs::set_permissions(&inbox, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let outcome = claim_next_pending_url(&data_dir);
+
+        fs::set_permissions(&inbox, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = outcome.expect_err("an inaccessible inbox must not look empty");
+        assert!(matches!(&error, NativeHostError::Io(_)));
+        assert!(fs::read(inbox.join("001.json")).is_ok());
+    }
+
+    fn processing_claim_folder_count(data_dir: &Path) -> usize {
+        let mut count = 0;
+        let entries = fs::read_dir(data_dir.join("incoming")).unwrap();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(".processing-") {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn inbox_item_count(data_dir: &Path) -> usize {
+        let mut count = 0;
+        let entries = fs::read_dir(data_dir.join("incoming")).unwrap();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                count += 1;
+            }
+        }
+        count
     }
 
     #[test]

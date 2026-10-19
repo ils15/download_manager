@@ -595,7 +595,17 @@ async fn absolute_timeout_keeps_cleanup_pending_for_manual_retry() {
     ));
     assert!(!destination.exists());
     assert!(!session.segment_temp_paths.lock().unwrap().is_empty());
-    discard_download_session(&session).await.unwrap();
+    // The manual retry removes the staging directory once the transfer's
+    // handles are closed. A path that is still busy stays pending for
+    // another local retry instead of failing the job.
+    let mut cleaned = false;
+    for _ in 0..3 {
+        if discard_download_session(&session).await.is_ok() {
+            cleaned = true;
+            break;
+        }
+    }
+    assert!(cleaned, "the staging cleanup must finish");
     assert_no_download_temporaries(directory.path());
     server.stop().await;
 }
@@ -625,6 +635,131 @@ async fn deadline_bounds_cleanup_and_leaves_the_registry_entry_pending() {
         .lock()
         .unwrap()
         .contains_key(&PathBuf::from("pending-staging-cleanup")));
+}
+
+/// A removal that never completes must not keep the caller waiting forever.
+#[tokio::test(start_paused = true)]
+async fn a_stuck_staging_removal_is_bounded_by_the_cleanup_step_timeout() {
+    let registry = Arc::new(StdMutex::new(HashMap::new()));
+    let path = PathBuf::from("stuck-staging-cleanup");
+    registry.lock().unwrap().insert(path.clone(), true);
+    let (started_tx, started_rx) = oneshot::channel();
+    let started = Arc::new(StdMutex::new(Some(started_tx)));
+    let cleanup_registry = registry.clone();
+    let cleanup = tokio::spawn(async move {
+        cleanup_registered_segment_paths(cleanup_registry, vec![path.clone()], None, move |_| {
+            let started = started.clone();
+            async move {
+                if let Some(sender) = started.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+                std::future::pending::<Result<(), std::io::Error>>().await
+            }
+        })
+        .await
+    });
+
+    // The removal is now pending, so its cleanup step timeout is registered.
+    started_rx.await.unwrap();
+    tokio::time::advance(CLEANUP_STEP_TIMEOUT).await;
+    let result = cleanup.await.unwrap();
+    let error = result.expect_err("a stuck removal must be reported");
+    assert!(error.contains("cleanup pending after the step timeout"));
+    assert!(registry
+        .lock()
+        .unwrap()
+        .contains_key(&PathBuf::from("stuck-staging-cleanup")));
+}
+
+/// A path that another handle keeps busy must be reported as a pending
+/// cleanup and stay registered, so a local retry can finish it later.
+#[tokio::test]
+async fn a_sharing_violation_keeps_the_staging_entry_for_a_manual_retry() {
+    let registry = Arc::new(StdMutex::new(HashMap::new()));
+    let path = PathBuf::from("busy-staging-cleanup");
+    registry.lock().unwrap().insert(path.clone(), true);
+    let busy_registry = registry.clone();
+    let outcome =
+        cleanup_registered_segment_paths(busy_registry, vec![path.clone()], None, move |_| async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated Windows sharing violation",
+            ))
+        })
+        .await;
+
+    let error = outcome.expect_err("a busy path must be reported");
+    assert!(error.contains("simulated Windows sharing violation"));
+    assert!(
+        registry.lock().unwrap().contains_key(&path),
+        "a busy path must stay registered for a manual retry"
+    );
+}
+
+/// A staging directory whose child file is still open must not block the
+/// cleanup: it either removes the path or reports it as pending, and the
+/// registry always matches what is really on disk.
+#[tokio::test]
+async fn staging_cleanup_terminates_and_keeps_a_busy_path_retryable() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = DownloadSession::default();
+    let destination = directory.path().join("busy-child.bin");
+    let staging =
+        SegmentStagingDirectory::create(&destination, session.segment_temp_paths.clone()).unwrap();
+    let child = staging.path.join("segment-0.part");
+    let handle = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&child)
+        .await
+        .unwrap();
+
+    let cleanup = cleanup_segment_temp_paths(&session);
+    let outcome = tokio::time::timeout(Duration::from_secs(30), cleanup)
+        .await
+        .expect("a busy staging path must not block the cleanup");
+    let registered = session
+        .segment_temp_paths
+        .lock()
+        .unwrap()
+        .contains_key(&staging.path);
+    match outcome {
+        Ok(()) => {
+            assert!(!staging.path.exists());
+            assert!(!registered, "a removed path must leave the registry");
+        }
+        Err(error) => {
+            // Windows keeps the path busy while the handle is open. The
+            // failure must stay retryable instead of failing the job.
+            assert!(staging.path.exists());
+            assert!(registered, "a busy path must stay registered for a retry");
+            assert!(error.contains(&staging.path.display().to_string()));
+        }
+    }
+
+    // The manual retry terminates as well and finishes the removal once the
+    // blocking handle is closed.
+    drop(handle);
+    let cleanup = cleanup_segment_temp_paths(&session);
+    let retry = tokio::time::timeout(Duration::from_secs(30), cleanup)
+        .await
+        .expect("the manual cleanup retry must not block either");
+    let registered = session
+        .segment_temp_paths
+        .lock()
+        .unwrap()
+        .contains_key(&staging.path);
+    assert_eq!(
+        registered,
+        staging.path.exists(),
+        "the registry must match the staging directory on disk"
+    );
+    if retry.is_err() {
+        assert!(registered, "a failed retry must keep the path registered");
+    } else {
+        assert!(!child.exists());
+    }
 }
 
 #[tokio::test(start_paused = true)]

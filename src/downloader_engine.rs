@@ -29,6 +29,14 @@ const GLOBAL_BANDWIDTH_QUANTUM_BYTES: u64 = 16 * 1024;
 const GLOBAL_BANDWIDTH_BUCKET_CAPACITY_BYTES: u64 = GLOBAL_BANDWIDTH_QUANTUM_BYTES;
 pub const MAX_SEGMENT_COUNT: u8 = 4;
 const SEGMENTED_MIN_BYTES: u64 = 8 * 1024 * 1024;
+/// Upper bound for a single cleanup step when the transfer deadline does not
+/// apply any more, for example a manual cleanup retry after a cancelled job.
+const CLEANUP_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many times a cleanup step is retried while another handle still holds
+/// the path. The blocking handle may still be in the middle of closing.
+const CLEANUP_SHARING_RETRIES: usize = 3;
+/// Pause between two cleanup attempts after a sharing violation.
+const CLEANUP_SHARING_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 // False protects a live partial alias; true makes the staging path eligible for cleanup.
 type SegmentTempRegistry = Arc<StdMutex<HashMap<PathBuf, bool>>>;
@@ -863,7 +871,9 @@ pub(crate) async fn install_test_committed_result(
 
 /// Removes any in-memory partial file owned by this queue entry.
 /// On filesystem failure it returns the I/O error without taking the session
-/// handle/path, so the same call can be retried later.
+/// handle/path, so the same call can be retried later. Every removal step is
+/// bounded, so a path that another handle keeps busy is reported instead of
+/// blocking the caller forever.
 pub async fn discard_download_session(session: &DownloadSession) -> Result<(), DownloadError> {
     let mut state = session.state.lock().await;
     // Close/remove a protected segmented partial alias before retrying its parent
@@ -1034,8 +1044,14 @@ async fn download_with_session_inner(
     // a flush. Only natural deadline expiry drops the outer operation before cleanup.
     let completion = wait_for_operation_until_deadline(deadline, operation.as_mut()).await;
     // In particular, discard the timed-out future before cleanup attempts to
-    // acquire the session mutex held by the transfer operation.
+    // acquire the session mutex held by the transfer operation. Dropping it
+    // also closes the segment handles and releases the connection-slot
+    // permits the transfer was holding, so the cleanup below runs without an
+    // open handle and without a reserved slot.
     drop(operation);
+    // The original absolute deadline still bounds this cleanup. A removal
+    // that cannot finish within it is reported as a pending cleanup for a
+    // manual retry; it never waits past the deadline.
     let segment_cleanup_error = cleanup_segment_temp_paths_until(session, deadline)
         .await
         .err();
@@ -1223,12 +1239,12 @@ impl OwnedTempFile {
     }
 
     async fn remove(&mut self) -> Result<(), std::io::Error> {
+        // Close the handle before the removal. On Windows an open handle
+        // without `FILE_SHARE_DELETE` turns the removal into
+        // `ERROR_ACCESS_DENIED`, so the close must be explicit and must
+        // happen first.
         drop(self.file.take());
-        match fs::remove_file(&self.path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        remove_file_if_exists(&self.path).await
     }
 
     fn into_partial(
@@ -1337,11 +1353,18 @@ async fn cleanup_segment_temp_paths_with_deadline(
         session.segment_temp_paths.clone(),
         paths,
         deadline,
-        fs::remove_dir_all,
+        |path| async move { remove_staging_tree(&path).await },
     )
     .await
 }
 
+/// Removes every registered staging path.
+///
+/// No step may wait forever: with a deadline the step is bounded by that
+/// deadline, and without one it is bounded by `CLEANUP_STEP_TIMEOUT`. A
+/// removal that fails because another handle still holds the path is retried
+/// a bounded number of times and then reported, so the caller can keep the
+/// entry for a manual retry instead of blocking.
 async fn cleanup_registered_segment_paths<F, Fut>(
     registry: SegmentTempRegistry,
     paths: Vec<PathBuf>,
@@ -1361,34 +1384,150 @@ where
             ));
             continue;
         }
-        let remove_future = remove(path.clone());
-        let outcome = match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, remove_future).await {
-                Ok(result) => result,
-                Err(_) => {
-                    failures.push(format!(
-                        "{}: cleanup pending after the absolute deadline",
-                        path.display()
-                    ));
+        let mut sharing_attempts = 0usize;
+        loop {
+            let remove_future = remove(path.clone());
+            let outcome = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, remove_future).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        failures.push(format!(
+                            "{}: cleanup pending after the absolute deadline",
+                            path.display()
+                        ));
+                        break;
+                    }
+                },
+                None => match tokio::time::timeout(CLEANUP_STEP_TIMEOUT, remove_future).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        failures.push(format!(
+                            "{}: cleanup pending after the step timeout",
+                            path.display()
+                        ));
+                        break;
+                    }
+                },
+            };
+            match outcome {
+                Ok(()) => {
+                    // A removal only counts as complete once the path is gone.
+                    let still_present = match fs::try_exists(&path).await {
+                        Ok(present) => present,
+                        Err(error) => {
+                            failures.push(format!("{}: {error}", path.display()));
+                            break;
+                        }
+                    };
+                    if still_present {
+                        failures.push(format!("{}: the path was not removed", path.display()));
+                        break;
+                    }
+                    lock_temp_registry(&registry).remove(&path);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    lock_temp_registry(&registry).remove(&path);
+                    break;
+                }
+                Err(error)
+                    if is_sharing_violation(&error)
+                        && sharing_attempts < CLEANUP_SHARING_RETRIES =>
+                {
+                    // Another handle still holds the path. It may still be in
+                    // the middle of closing, so retry a bounded number of
+                    // times and then report the failure for a manual retry.
+                    sharing_attempts += 1;
+                    pause_before_cleanup_retry().await;
                     continue;
                 }
-            },
-            None => remove_future.await,
-        };
-        match outcome {
-            Ok(()) => {
-                lock_temp_registry(&registry).remove(&path);
+                Err(error) => {
+                    failures.push(format!("{}: {error}", path.display()));
+                    break;
+                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                lock_temp_registry(&registry).remove(&path);
-            }
-            Err(error) => failures.push(format!("{}: {error}", path.display())),
         }
     }
     if failures.is_empty() {
         Ok(())
     } else {
         Err(failures.join("; "))
+    }
+}
+
+/// Reports whether an I/O error means "another handle still holds this path".
+#[cfg(windows)]
+fn is_sharing_violation(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    // Windows reports a busy path as `ERROR_ACCESS_DENIED` (5),
+    // `ERROR_SHARING_VIOLATION` (32), `ERROR_LOCK_VIOLATION` (33) or
+    // `ERROR_DIR_NOT_EMPTY` (145).
+    let raw = error.raw_os_error();
+    matches!(raw, Some(5) | Some(32) | Some(33) | Some(145))
+}
+
+/// Reports whether an I/O error means "another handle still holds this path".
+#[cfg(not(windows))]
+fn is_sharing_violation(error: &std::io::Error) -> bool {
+    // A Unix unlink succeeds while a handle is open, so a busy path is only
+    // reported through the permission error.
+    error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// Waits a short, real-time pause between two cleanup attempts.
+///
+/// The pause is deliberately not clock based. A paused test clock must never
+/// be able to stall a cleanup, and the handle that blocks a removal is closed
+/// by the operating system rather than by the test clock.
+async fn pause_before_cleanup_retry() {
+    let sleeper = std::thread::sleep;
+    let paused = tokio::task::spawn_blocking(move || sleeper(CLEANUP_SHARING_RETRY_DELAY));
+    let _ = paused.await;
+}
+
+/// Removes a staging directory and everything below it.
+///
+/// `std::fs::remove_dir_all` is deliberately not used: on Windows it retries
+/// the parent directory while a child file is still open, which can block the
+/// caller for an unbounded time, and it can report success while the
+/// directory is still present. Every step here is a single filesystem call.
+async fn remove_staging_tree(path: &Path) -> Result<(), std::io::Error> {
+    let mut directories = vec![path.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let mut entries = match fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let child = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                directories.push(child);
+            } else {
+                remove_file_if_exists(&child).await?;
+            }
+        }
+        remove_dir_if_exists(&directory).await?;
+    }
+    Ok(())
+}
+
+async fn remove_file_if_exists(path: &Path) -> Result<(), std::io::Error> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn remove_dir_if_exists(path: &Path) -> Result<(), std::io::Error> {
+    match fs::remove_dir(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1825,6 +1964,10 @@ async fn download_segmented(
         match result {
             Ok(Some(part)) => parts.push(part),
             Ok(None) => {
+                // Dropping the pending segment futures closes their staging
+                // handles, and the finished parts are closed and removed by the
+                // cleanup below, so the staging directory can be removed
+                // afterwards.
                 drop(tasks);
                 cleanup_segment_parts(&mut parts, deadline).await?;
                 execution.progress.reset(0);

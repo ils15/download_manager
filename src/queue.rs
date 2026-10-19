@@ -1131,108 +1131,256 @@ mod tests {
         sync::{mpsc, oneshot},
     };
 
-    async fn start_stalled_range_server() -> (
-        String,
-        CancellationToken,
-        tokio::task::JoinHandle<()>,
-        Arc<StdMutex<Vec<String>>>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let shutdown = CancellationToken::new();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let active = Arc::new(AtomicUsize::new(0));
-        let maximum_active = Arc::new(AtomicUsize::new(0));
-        let server_shutdown = shutdown.clone();
-        let server_requests = requests.clone();
-        let server_active = active.clone();
-        let server_maximum_active = maximum_active.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                let accepted = tokio::select! {
-                    biased;
-                    _ = server_shutdown.cancelled() => break,
-                    accepted = listener.accept() => accepted,
-                };
-                let Ok((stream, _)) = accepted else { break };
-                let request_log = server_requests.clone();
-                let stop = server_shutdown.clone();
-                let active = server_active.clone();
-                let maximum_active = server_maximum_active.clone();
-                let now_active = active.fetch_add(1, AtomicOrdering::AcqRel) + 1;
-                maximum_active.fetch_max(now_active, AtomicOrdering::AcqRel);
-                tokio::spawn(async move {
-                    serve_stalled_range_request(stream, request_log, stop).await;
-                    active.fetch_sub(1, AtomicOrdering::AcqRel);
-                });
-            }
-        });
-        (
-            format!("http://{address}"),
-            shutdown,
-            task,
-            requests,
-            active,
-            maximum_active,
-        )
+    /// A boundary reported by the stalled Range fixture.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum FixtureEvent {
+        /// A request was received on a connection.
+        Request(String),
+        /// A connection was closed.
+        Closed,
+        /// The fixture stopped accepting new connections.
+        Held,
     }
 
-    async fn serve_stalled_range_request(
-        mut stream: TcpStream,
-        requests: Arc<StdMutex<Vec<String>>>,
+    /// A command for the stalled Range fixture.
+    #[derive(Debug, Clone, Copy)]
+    enum FixtureCommand {
+        /// Keep new connections in the listen backlog.
+        Hold,
+        /// Accept the pending connections again.
+        Resume,
+    }
+
+    /// A local origin that serves stalled Range responses.
+    ///
+    /// The fixture reports every request and every closed connection, so a
+    /// test can synchronize on an exact boundary instead of polling a
+    /// counter. It can also hold new connections in the listen backlog, so a
+    /// cancelled transfer's sockets are reaped before the next transfer
+    /// connects and the observed peak measures the client's own concurrency.
+    struct StalledRangeServer {
+        base_url: String,
         shutdown: CancellationToken,
-    ) {
-        let request = read_request_text(&mut stream).await;
-        let path = request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("/")
-            .to_owned();
-        requests.lock().unwrap().push(path);
-        let range = request.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("range")
-                .then(|| value.trim().strip_prefix("bytes=").map(str::to_owned))
-                .flatten()
-        });
-        let Some((start, end)) = range
-            .as_deref()
-            .and_then(|range| range.split_once('-'))
-            .and_then(|(start, end)| Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?)))
-        else {
-            return;
-        };
-        let total = 8 * 1024 * 1024;
-        let length = end - start + 1;
-        let response = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Length: {length}\r\nContent-Range: bytes {start}-{end}/{total}\r\nETag: \"fixture-v1\"\r\nConnection: close\r\n\r\n"
-        );
-        if stream.write_all(response.as_bytes()).await.is_err() {
-            return;
-        }
-        if stream.write_all(b"x").await.is_err() {
-            return;
-        }
-        if start == 0 && end == 0 {
-            return;
-        }
-        let mut client_closed = [0u8; 1];
-        tokio::select! {
-            _ = shutdown.cancelled() => {},
-            _ = stream.read(&mut client_closed) => {},
-        }
+        task: tokio::task::JoinHandle<()>,
+        events: mpsc::UnboundedReceiver<FixtureEvent>,
+        control: mpsc::UnboundedSender<FixtureCommand>,
+        seen: Vec<FixtureEvent>,
+        open: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
     }
 
-    fn count_path_requests(requests: &StdMutex<Vec<String>>, path: &str) -> usize {
-        requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request_path| request_path.as_str() == path)
-            .count()
+    impl StalledRangeServer {
+        async fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let shutdown = CancellationToken::new();
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+            let open = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let server_shutdown = shutdown.clone();
+            let server_open = open.clone();
+            let server_peak = peak.clone();
+            let task = tokio::spawn(async move {
+                let mut held = false;
+                'server: loop {
+                    if held {
+                        tokio::select! {
+                            biased;
+                            _ = server_shutdown.cancelled() => break 'server,
+                            command = control_rx.recv() => match command {
+                                Some(FixtureCommand::Hold) => {}
+                                Some(FixtureCommand::Resume) => held = false,
+                                None => break 'server,
+                            },
+                        }
+                        continue;
+                    }
+                    let accepted = tokio::select! {
+                        biased;
+                        _ = server_shutdown.cancelled() => break 'server,
+                        command = control_rx.recv() => match command {
+                            Some(FixtureCommand::Hold) => {
+                                held = true;
+                                let _ = event_tx.send(FixtureEvent::Held);
+                                continue 'server;
+                            }
+                            Some(FixtureCommand::Resume) => continue 'server,
+                            None => break 'server,
+                        },
+                        accepted = listener.accept() => accepted,
+                    };
+                    let Ok((mut stream, _)) = accepted else { break };
+                    let now_open = server_open.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+                    server_peak.fetch_max(now_open, AtomicOrdering::AcqRel);
+                    let request = read_request_text(&mut stream).await;
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_owned();
+                    let range = request.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("range")
+                            .then(|| value.trim().strip_prefix("bytes=").map(str::to_owned))
+                            .flatten()
+                    });
+                    let Some((start, end)) = range
+                        .as_deref()
+                        .and_then(|range| range.split_once('-'))
+                        .and_then(|(start, end)| {
+                            Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
+                        })
+                    else {
+                        drop(stream);
+                        server_open.fetch_sub(1, AtomicOrdering::AcqRel);
+                        let _ = event_tx.send(FixtureEvent::Closed);
+                        continue;
+                    };
+                    let total: u64 = 8 * 1024 * 1024;
+                    let length = end - start + 1;
+                    let response = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {length}\r\nContent-Range: bytes {start}-{end}/{total}\r\nETag: \"fixture-v1\"\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = event_tx.send(FixtureEvent::Request(path));
+                    if start == 0 && end == 0 {
+                        // The probe is a complete, short exchange. Answering it
+                        // in the accept loop keeps its connection closed before
+                        // the next accept, so a probe and a segment are never
+                        // counted as concurrent.
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(b"x").await;
+                        drop(stream);
+                        server_open.fetch_sub(1, AtomicOrdering::AcqRel);
+                        let _ = event_tx.send(FixtureEvent::Closed);
+                        continue;
+                    }
+                    // A segment connection stays open until the client closes it.
+                    let stop = server_shutdown.clone();
+                    let event_tx = event_tx.clone();
+                    let server_open = server_open.clone();
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.write_all(b"x").await;
+                        let mut client_closed = [0u8; 1];
+                        tokio::select! {
+                            _ = stop.cancelled() => {},
+                            _ = stream.read(&mut client_closed) => {},
+                        }
+                        drop(stream);
+                        server_open.fetch_sub(1, AtomicOrdering::AcqRel);
+                        let _ = event_tx.send(FixtureEvent::Closed);
+                    });
+                }
+            });
+            Self {
+                base_url: format!("http://{address}"),
+                shutdown,
+                task,
+                events: event_rx,
+                control: control_tx,
+                seen: Vec::new(),
+                open,
+                peak,
+            }
+        }
+
+        /// Waits until `count` requests for `path` have been received.
+        async fn wait_for_requests(&mut self, path: &str, count: usize) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.request_count(path) < count {
+                    let event = self
+                        .events
+                        .recv()
+                        .await
+                        .expect("the fixture server is still running");
+                    self.seen.push(event);
+                }
+            })
+            .await
+            .expect("the fixture server did not report the expected requests");
+        }
+
+        /// Waits until `count` connections have been closed.
+        async fn wait_for_closed(&mut self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.closed_count() < count {
+                    let event = self
+                        .events
+                        .recv()
+                        .await
+                        .expect("the fixture server is still running");
+                    self.seen.push(event);
+                }
+            })
+            .await
+            .expect("the fixture server did not report the expected closures");
+        }
+
+        /// Waits until the fixture stopped accepting new connections.
+        async fn wait_for_held(&mut self) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.held_count() == 0 {
+                    let event = self
+                        .events
+                        .recv()
+                        .await
+                        .expect("the fixture server is still running");
+                    self.seen.push(event);
+                }
+            })
+            .await
+            .expect("the fixture server did not confirm the hold");
+        }
+
+        fn request_count(&self, path: &str) -> usize {
+            self.seen
+                .iter()
+                .filter(|event| match event {
+                    FixtureEvent::Request(requested) => requested == path,
+                    FixtureEvent::Closed | FixtureEvent::Held => false,
+                })
+                .count()
+        }
+
+        fn closed_count(&self) -> usize {
+            self.seen
+                .iter()
+                .filter(|event| matches!(event, FixtureEvent::Closed))
+                .count()
+        }
+
+        fn held_count(&self) -> usize {
+            self.seen
+                .iter()
+                .filter(|event| matches!(event, FixtureEvent::Held))
+                .count()
+        }
+
+        /// The highest number of connections that were open at the same time.
+        fn peak(&self) -> usize {
+            self.peak.load(AtomicOrdering::Acquire)
+        }
+
+        fn open_count(&self) -> usize {
+            self.open.load(AtomicOrdering::Acquire)
+        }
+
+        /// Keeps new connections in the listen backlog.
+        fn hold(&self) {
+            let _ = self.control.send(FixtureCommand::Hold);
+        }
+
+        /// Accepts the pending connections again.
+        fn resume(&self) {
+            let _ = self.control.send(FixtureCommand::Resume);
+        }
+
+        async fn stop(self) {
+            self.shutdown.cancel();
+            let _ = self.task.await;
+        }
     }
 
     /// The segmented path only engages for bodies of at least 8 MiB, so the
@@ -1566,8 +1714,8 @@ mod tests {
 
     #[tokio::test]
     async fn range_jobs_compete_for_connection_quota_with_priority_without_preemption() {
-        let (base_url, server_shutdown, server_task, requests, active, maximum_active) =
-            start_stalled_range_server().await;
+        let mut server = StalledRangeServer::start().await;
+        let base_url = server.base_url.clone();
         let directory = tempfile::tempdir().unwrap();
         let mut queue = DownloadQueue::new(2).unwrap();
         queue.set_max_segments(2).unwrap();
@@ -1624,13 +1772,9 @@ mod tests {
         queue.set_priority(high_id, Priority::High).await.unwrap();
 
         drop(held_first);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while count_path_requests(&requests, "/high") < 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the High-priority Range job should acquire the first scheduler permit");
+        // The High-priority job takes the first scheduler permit and opens its
+        // Range probe plus both segment streams.
+        server.wait_for_requests("/high", 3).await;
         let high_session = queue
             .inner
             .jobs
@@ -1644,8 +1788,9 @@ mod tests {
             .await
             .expect("the first transfer should hold the complete segment reservation");
         assert_eq!(queue.inner.connection_slots.available_permits(), 0);
-        assert_eq!(count_path_requests(&requests, "/low"), 0);
-        assert!(maximum_active.load(AtomicOrdering::Acquire) <= 2);
+        assert_eq!(server.request_count("/high"), 3);
+        assert_eq!(server.request_count("/low"), 0);
+        assert!(server.peak() <= 2);
 
         // A priority update is for waiting jobs only: it must not preempt the
         // active high-priority transfer or its atomic two-slot reservation.
@@ -1665,7 +1810,7 @@ mod tests {
         })
         .await
         .expect("the second transfer should reach its connection-slot wait");
-        assert_eq!(count_path_requests(&requests, "/low"), 0);
+        assert_eq!(server.request_count("/low"), 0);
         assert_eq!(queue.inner.connection_slots.available_permits(), 0);
         assert!(queue
             .snapshots()
@@ -1683,17 +1828,24 @@ mod tests {
             .clone();
         assert!(!high_cancel.is_cancelled());
 
-        // Releasing the first transfer lets the second obtain its probe and full
-        // two-slot reservation; this also guards against holding a probe slot while
-        // waiting atomically for all segment slots.
-        queue.cancel(high_id).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while count_path_requests(&requests, "/low") < 3 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the waiting transfer should proceed after the quota is released");
+        // Hold new connections so the cancelled transfer's sockets are reaped
+        // before the waiting transfer connects. The observed peak then
+        // measures the client's own concurrency instead of a handover race.
+        server.hold();
+        server.wait_for_held().await;
+        // Releasing the first transfer lets the second obtain its probe and
+        // full two-slot reservation; this also guards against holding a probe
+        // slot while waiting atomically for all segment slots.
+        match queue.cancel(high_id).await {
+            Ok(()) => {}
+            // A local cleanup that cannot finish yet is a retryable state,
+            // not a failed transfer.
+            Err(QueueError::Download(DownloadError::CleanupPending { .. })) => {}
+            Err(error) => panic!("unexpected cancel outcome: {error}"),
+        }
+        server.wait_for_closed(3).await;
+        server.resume();
+        server.wait_for_requests("/low", 3).await;
         let low_session = queue
             .inner
             .jobs
@@ -1706,20 +1858,55 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), low_session.wait_for_bytes(2))
             .await
             .expect("the second transfer should finish opening both Range streams");
-        assert!(maximum_active.load(AtomicOrdering::Acquire) <= 2);
+        assert!(server.peak() <= 2);
 
-        queue.cancel(low_id).await.unwrap();
+        match queue.cancel(low_id).await {
+            Ok(()) => {}
+            Err(QueueError::Download(DownloadError::CleanupPending { .. })) => {}
+            Err(error) => panic!("unexpected cancel outcome: {error}"),
+        }
+        // The cancelled transfer gives its connection slots back even when its
+        // local cleanup is still pending.
         assert_eq!(queue.inner.connection_slots.available_permits(), 2);
-        server_shutdown.cancel();
-        server_task.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while active.load(AtomicOrdering::Acquire) != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all local HTTP connections should close");
-        assert!(maximum_active.load(AtomicOrdering::Acquire) <= 2);
+        server.wait_for_closed(6).await;
+        assert_eq!(server.open_count(), 0);
+        let peak = server.peak();
+        server.stop().await;
+        assert!(peak <= 2);
+    }
+
+    /// A cancelled transfer must give its connection slots back, so a waiting
+    /// job is never blocked by a transfer that is no longer running.
+    #[tokio::test]
+    async fn cancelling_a_transfer_releases_its_connection_slots() {
+        let mut server = StalledRangeServer::start().await;
+        let base_url = server.base_url.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DownloadQueue::new(2).unwrap();
+        queue.set_max_segments(2).unwrap();
+        let request = DownloadRequest {
+            url: format!("{base_url}/stuck"),
+            destination: directory.path().join("stuck.bin"),
+            expected_sha256: None,
+            max_retries: 0,
+            bytes_per_second: None,
+            max_bytes: 8 * 1024 * 1024,
+            max_duration: Duration::from_secs(60),
+        };
+        let id = queue.enqueue(request, None).await.unwrap();
+        server.wait_for_requests("/stuck", 3).await;
+        assert_eq!(queue.inner.connection_slots.available_permits(), 0);
+
+        // The local cleanup of a cancelled transfer may still be pending, but
+        // the connection slots are released either way.
+        let outcome = queue.cancel(id).await;
+        assert!(matches!(
+            outcome,
+            Ok(()) | Err(QueueError::Download(DownloadError::CleanupPending { .. }))
+        ));
+        assert_eq!(queue.inner.connection_slots.available_permits(), 2);
+        server.wait_for_closed(3).await;
+        server.stop().await;
     }
 
     /// The queue worker must take the segmented path for a Range-capable origin
