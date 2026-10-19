@@ -308,12 +308,13 @@ async fn segmented_download_concatenates_ranges_in_order_and_hashes_exact_conten
     request.expected_sha256 = Some(expected_hash.clone());
     let limiter = SharedBandwidthLimiter::new(0).unwrap();
 
-    let result = download_with_session_managed_with_limiter_and_segments(
+    let result = download_with_session_managed_with_limiter_segments_and_slots(
         request,
         CancellationToken::new(),
         &DownloadSession::default(),
         &limiter,
         4,
+        Arc::new(Semaphore::new(4)),
     )
     .await
     .unwrap();
@@ -444,7 +445,7 @@ async fn unsupported_or_inconsistent_ranges_cleanly_fall_back_to_single_stream()
         let destination = directory.path().join("fallback.bin");
         let limiter = SharedBandwidthLimiter::new(0).expect("unlimited limiter");
 
-        let result = download_with_session_managed_with_limiter_and_segments(
+        let result = download_with_session_managed_with_limiter_segments_and_slots(
             request(
                 server.url.clone(),
                 destination.clone(),
@@ -454,6 +455,7 @@ async fn unsupported_or_inconsistent_ranges_cleanly_fall_back_to_single_stream()
             &DownloadSession::default(),
             &limiter,
             4,
+            Arc::new(Semaphore::new(4)),
         )
         .await;
 
@@ -485,7 +487,7 @@ async fn truncated_single_stream_fallback_fails_cleanly_and_publishes_no_destina
     let limiter = SharedBandwidthLimiter::new(0).expect("unlimited limiter");
     let session = DownloadSession::default();
 
-    let result = download_with_session_managed_with_limiter_and_segments(
+    let result = download_with_session_managed_with_limiter_segments_and_slots(
         request(
             server.url.clone(),
             destination.clone(),
@@ -495,6 +497,7 @@ async fn truncated_single_stream_fallback_fails_cleanly_and_publishes_no_destina
         &session,
         &limiter,
         4,
+        Arc::new(Semaphore::new(4)),
     )
     .await;
 
@@ -539,12 +542,13 @@ async fn cancellation_removes_all_segment_temporaries() {
     let worker_url = server.url.clone();
     let worker_destination = destination.clone();
     let worker = tokio::spawn(async move {
-        download_with_session_managed_with_limiter_and_segments(
+        download_with_session_managed_with_limiter_segments_and_slots(
             request(worker_url, worker_destination, Duration::from_secs(60)),
             worker_cancel,
             &worker_session,
             &worker_limiter,
             4,
+            Arc::new(Semaphore::new(4)),
         )
         .await
     });
@@ -572,12 +576,13 @@ async fn absolute_timeout_keeps_cleanup_pending_for_manual_retry() {
     let worker_url = server.url.clone();
     let worker_destination = destination.clone();
     let worker = tokio::spawn(async move {
-        download_with_session_managed_with_limiter_and_segments(
+        download_with_session_managed_with_limiter_segments_and_slots(
             request(worker_url, worker_destination, Duration::from_secs(1)),
             CancellationToken::new(),
             &worker_session,
             &limiter,
             4,
+            Arc::new(Semaphore::new(4)),
         )
         .await
     });
@@ -689,7 +694,7 @@ async fn deadline_during_an_open_in_flight_keeps_cleanup_pending_until_handle_dr
         session.segment_temp_paths.clone(),
         vec![staging_path.clone()],
         Some(deadline),
-        |path| fs::remove_dir_all(path),
+        fs::remove_dir_all,
     )
     .await;
     assert!(cleanup

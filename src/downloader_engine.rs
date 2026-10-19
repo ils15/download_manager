@@ -911,55 +911,13 @@ pub async fn download_with_session(
     download_with_session_inner(request, cancel, session, true, None, 1, None).await
 }
 
-pub(crate) async fn download_with_session_managed_with_limiter(
-    request: DownloadRequest,
-    cancel: CancellationToken,
-    session: &DownloadSession,
-    bandwidth_limiter: &SharedBandwidthLimiter,
-) -> Result<DownloadResult, DownloadError> {
-    download_with_session_inner(
-        request,
-        cancel,
-        session,
-        false,
-        Some(bandwidth_limiter),
-        1,
-        None,
-    )
-    .await
-}
-
-pub(crate) async fn download_with_session_managed_with_limiter_and_segments(
-    request: DownloadRequest,
-    cancel: CancellationToken,
-    session: &DownloadSession,
-    bandwidth_limiter: &SharedBandwidthLimiter,
-    max_segments: u8,
-) -> Result<DownloadResult, DownloadError> {
-    if !(1..=MAX_SEGMENT_COUNT).contains(&max_segments) {
-        return Err(DownloadError::InvalidLimit);
-    }
-    if max_segments == 1 {
-        return download_with_session_managed_with_limiter(
-            request,
-            cancel,
-            session,
-            bandwidth_limiter,
-        )
-        .await;
-    }
-    download_with_session_inner(
-        request,
-        cancel,
-        session,
-        false,
-        Some(bandwidth_limiter),
-        max_segments,
-        None,
-    )
-    .await
-}
-
+/// The single entry point for a managed transfer.
+///
+/// `max_segments` selects the transfer shape: one means a single stream, and a
+/// value above one makes the engine probe the origin for `Range` support and,
+/// when the probe succeeds, fetch the body as concurrent segments. The probe
+/// and every confirmed segment hold one slot of `connection_slots`; a
+/// single-stream fallback holds exactly one.
 pub(crate) async fn download_with_session_managed_with_limiter_segments_and_slots(
     request: DownloadRequest,
     cancel: CancellationToken,
@@ -1218,11 +1176,6 @@ struct OwnedTempFile {
 }
 
 impl OwnedTempFile {
-    async fn create(path: PathBuf) -> Result<Self, DownloadError> {
-        let cancel = CancellationToken::new();
-        Self::create_until(path, &cancel, None).await
-    }
-
     async fn create_until(
         path: PathBuf,
         cancel: &CancellationToken,
@@ -1384,7 +1337,7 @@ async fn cleanup_segment_temp_paths_with_deadline(
         session.segment_temp_paths.clone(),
         paths,
         deadline,
-        |path| fs::remove_dir_all(path),
+        fs::remove_dir_all,
     )
     .await
 }
@@ -2931,8 +2884,7 @@ mod tests {
         .await
         .unwrap();
 
-        let final_wait_nanos =
-            ((37u128 * NANOS_PER_SECOND + u128::from(quantum) - 1) / u128::from(quantum)) as u64;
+        let final_wait_nanos = (37u128 * NANOS_PER_SECOND).div_ceil(u128::from(quantum)) as u64;
         let expected_minimum = Duration::from_secs(2) + Duration::from_nanos(final_wait_nanos);
         let elapsed = Instant::now().duration_since(started);
         // Tokio's virtual timer wakeups can round slightly late; allow 5 ms of

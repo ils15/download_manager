@@ -1235,6 +1235,114 @@ mod tests {
             .count()
     }
 
+    /// The segmented path only engages for bodies of at least 8 MiB, so the
+    /// fixture origin serves exactly that much.
+    fn range_payload() -> Vec<u8> {
+        (0..8 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect()
+    }
+
+    /// A Range-capable origin with a strong ETag. It counts the requests that
+    /// arrived with and without a `Range` header, so a test can tell a segmented
+    /// transfer apart from a single-stream fallback.
+    async fn start_range_server() -> (
+        String,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let range_hits = Arc::new(AtomicUsize::new(0));
+        let full_hits = Arc::new(AtomicUsize::new(0));
+        let payload = Arc::new(range_payload());
+        let server_shutdown = shutdown.clone();
+        let server_range_hits = range_hits.clone();
+        let server_full_hits = full_hits.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = server_shutdown.cancelled() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((stream, _)) = accepted else { break };
+                let body = payload.clone();
+                let ranges = server_range_hits.clone();
+                let full = server_full_hits.clone();
+                tokio::spawn(async move {
+                    serve_range_request(stream, body, ranges, full).await;
+                });
+            }
+        });
+        (
+            format!("http://{address}"),
+            shutdown,
+            task,
+            range_hits,
+            full_hits,
+        )
+    }
+
+    async fn serve_range_request(
+        mut stream: TcpStream,
+        payload: Arc<Vec<u8>>,
+        range_hits: Arc<AtomicUsize>,
+        full_hits: Arc<AtomicUsize>,
+    ) {
+        let request = read_request_text(&mut stream).await;
+        let total = payload.len();
+        let range = request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("range")
+                .then(|| value.trim().strip_prefix("bytes=").map(str::to_owned))
+                .flatten()
+        });
+        let Some(range) = range else {
+            full_hits.fetch_add(1, AtomicOrdering::AcqRel);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nETag: \"fixture-v1\"\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(head.as_bytes()).await.is_ok() {
+                let _ = stream.write_all(payload.as_slice()).await;
+            }
+            return;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            return;
+        };
+        let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) else {
+            return;
+        };
+        if start > end || end >= total {
+            return;
+        }
+        range_hits.fetch_add(1, AtomicOrdering::AcqRel);
+        let head = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{total}\r\nETag: \"fixture-v1\"\r\nConnection: close\r\n\r\n",
+            end - start + 1
+        );
+        if stream.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = stream.write_all(&payload[start..=end]).await;
+    }
+
+    fn range_request(url: String, destination: &Path) -> DownloadRequest {
+        DownloadRequest {
+            url,
+            destination: destination.to_path_buf(),
+            expected_sha256: None,
+            max_retries: 0,
+            bytes_per_second: None,
+            max_bytes: 8 * 1024 * 1024,
+            max_duration: Duration::from_secs(30),
+        }
+    }
+
     #[test]
     fn concurrency_limit_must_be_positive() {
         assert!(matches!(
@@ -1612,6 +1720,46 @@ mod tests {
         .await
         .expect("all local HTTP connections should close");
         assert!(maximum_active.load(AtomicOrdering::Acquire) <= 2);
+    }
+
+    /// The queue worker must take the segmented path for a Range-capable origin
+    /// once more than one segment is allowed, and must stay on a single stream
+    /// when only one segment is allowed.
+    #[tokio::test]
+    async fn queue_worker_segments_a_range_capable_origin_and_streams_it_with_one_segment() {
+        let payload = range_payload();
+        let (base_url, shutdown, server, range_hits, full_hits) = start_range_server().await;
+        let directory = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_secs(30);
+
+        let segmented_queue = DownloadQueue::new(2).unwrap();
+        segmented_queue.set_max_segments(2).unwrap();
+        let segmented_path = directory.path().join("segmented.bin");
+        let request = range_request(format!("{base_url}/segmented"), &segmented_path);
+        let id = segmented_queue.enqueue(request, None).await.unwrap();
+        let segmented = wait_for_completion_within(&segmented_queue, id, timeout).await;
+        assert_eq!(segmented.bytes, payload.len() as u64);
+        let published = std::fs::read(&segmented_path).unwrap();
+        assert_eq!(published, payload.as_slice());
+        // One Range probe plus two segment bodies, and no single-stream fallback.
+        assert_eq!(range_hits.load(AtomicOrdering::Acquire), 3);
+        assert_eq!(full_hits.load(AtomicOrdering::Acquire), 0);
+
+        let single_queue = DownloadQueue::new(2).unwrap();
+        single_queue.set_max_segments(1).unwrap();
+        let single_path = directory.path().join("single.bin");
+        let request = range_request(format!("{base_url}/single"), &single_path);
+        let id = single_queue.enqueue(request, None).await.unwrap();
+        let single = wait_for_completion_within(&single_queue, id, timeout).await;
+        assert_eq!(single.bytes, payload.len() as u64);
+        let published = std::fs::read(&single_path).unwrap();
+        assert_eq!(published, payload.as_slice());
+        // One segment never probes for ranges: the body arrives in one plain request.
+        assert_eq!(range_hits.load(AtomicOrdering::Acquire), 3);
+        assert_eq!(full_hits.load(AtomicOrdering::Acquire), 1);
+
+        shutdown.cancel();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -2524,7 +2672,17 @@ mod tests {
     }
 
     async fn wait_for_completion(queue: &DownloadQueue, id: Uuid) -> DownloadResult {
-        tokio::time::timeout(Duration::from_secs(3), async {
+        wait_for_completion_within(queue, id, Duration::from_secs(3)).await
+    }
+
+    /// Waits for a terminal completion and reports a failed job with its
+    /// operation instead of a bare timeout.
+    async fn wait_for_completion_within(
+        queue: &DownloadQueue,
+        id: Uuid,
+        timeout: Duration,
+    ) -> DownloadResult {
+        tokio::time::timeout(timeout, async {
             loop {
                 if let Some(snapshot) = queue
                     .snapshots()
@@ -2532,8 +2690,12 @@ mod tests {
                     .into_iter()
                     .find(|snapshot| snapshot.id == id)
                 {
-                    if let JobState::Completed(result) = snapshot.state {
-                        return result;
+                    match snapshot.state {
+                        JobState::Completed(result) => return result,
+                        JobState::Failed(operation) => {
+                            panic!("the queued download failed: {operation}")
+                        }
+                        _ => {}
                     }
                 }
                 tokio::task::yield_now().await;
