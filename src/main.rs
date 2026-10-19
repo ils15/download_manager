@@ -255,22 +255,24 @@ fn build_job_rows(snapshots: &[JobSnapshot], category: Category) -> Vec<JobRow> 
                     let cleanup = result
                         .cleanup_pending
                         .as_ref()
-                        .map(|message| format!(" · cleanup pending: {message}"))
+                        .map(|message| format!(" · limpeza pendente: {message}"))
                         .unwrap_or_default();
                     format!(
-                        "Completed · {} bytes · staging SHA-256 {}{}",
+                        "Concluído · {} bytes · preparando SHA-256 {}{}",
                         result.bytes, result.sha256, cleanup
                     )
                 }
                 JobState::CancelledCleanupPending(error) => {
-                    format!("Cancelled · {progress_details} · cleanup pending: {error}")
+                    format!("Cancelado · {progress_details} · limpeza pendente: {error}")
                 }
                 JobState::FailedCleanupPending {
                     operation,
                     cleanup_error,
-                } => format!("{operation} · {progress_details} · cleanup pending: {cleanup_error}"),
-                JobState::Failed(error) => format!("Failed · {progress_details} · {error}"),
-                state => format!("{} · {progress_details}", state.label()),
+                } => {
+                    format!("{operation} · {progress_details} · limpeza pendente: {cleanup_error}")
+                }
+                JobState::Failed(error) => format!("Falhou · {progress_details} · {error}"),
+                state => format!("{} · {progress_details}", describe_state(state).0),
             };
             JobRow {
                 id: job.id.to_string().into(),
@@ -541,7 +543,10 @@ impl ProgressAnnouncementTracker {
         let progress = percentage_bucket
             .map(|percentage| format!(" · {percentage}%"))
             .unwrap_or_else(|| format!(" · {} bytes", job.bytes_received));
-        Some(format!("{filename}: {}{progress}", job.state.label()))
+        Some(format!(
+            "{filename}: {}{progress}",
+            describe_state(&job.state).0
+        ))
     }
 }
 
@@ -1434,9 +1439,9 @@ fn history_entry(job: &JobSnapshot, finished_at_utc: &str) -> Option<HistoryEntr
     };
     let status = match &job.state {
         JobState::Completed(result) if result.cleanup_pending.is_some() => {
-            "Completed (cleanup pending)".to_owned()
+            "Concluído (limpeza pendente)".to_owned()
         }
-        _ => job.state.label().to_owned(),
+        _ => describe_state(&job.state).0.to_owned(),
     };
     Some(HistoryEntry {
         job_id: job.id.to_string(),
@@ -1828,8 +1833,8 @@ fn notification_message(job: &JobSnapshot, kind: NotificationKind) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("download");
     let outcome = match kind {
-        NotificationKind::Completed => "completed",
-        NotificationKind::Failed => "failed",
+        NotificationKind::Completed => "concluído",
+        NotificationKind::Failed => "falhou",
     };
     format!(
         "Download {outcome}: {filename} · {}",
@@ -2489,7 +2494,7 @@ mod tests {
         let loaded = load_history(&path).unwrap();
 
         assert_eq!(loaded.entries.len(), 1);
-        assert_eq!(loaded.entries[0].status, "Completed");
+        assert_eq!(loaded.entries[0].status, "Concluído");
         assert_eq!(loaded.entries[0].destination, "archive.zip");
         assert_eq!(loaded.entries[0].bytes, 42);
         let expected_sha256 = "ab".repeat(32);

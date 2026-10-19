@@ -246,8 +246,10 @@ component MenuPopupItem inherits Rectangle {
 
     forward-focus: i-focus;
 
-    height: entry_data.separator_before ? 29px : 24px;
-    background: entry_data.enabled && i-hover.has-hover ? Theme.accent_soft : transparent;
+    // Every row keeps the same height so the drop-down height stays exact;
+    // the separator is drawn inside the row that follows it.
+    height: 24px;
+    background: root.entry_data.enabled && i-hover.has-hover ? Theme.accent_soft : transparent;
 
     accessible-role: button;
     accessible-label: root.entry_data.label;
@@ -549,7 +551,11 @@ component DownloadRowItem inherits Rectangle {
     accessible-role: list-item;
     accessible-label: root.job.name + " — " + root.job.status_text;
 
+    // Selection marker. The x/y are explicit on purpose: a child without them
+    // is not anchored to the parent origin by the layout engine.
     Rectangle {
+        x: 0px;
+        y: 0px;
         width: 3px;
         height: parent.height;
         background: Theme.accent;
@@ -1343,7 +1349,10 @@ export component MainWindow inherits Window {
                 }
                 Button {
                     text: root.cleanup_retry_in_progress ? "Limpando…" : "Repetir limpeza";
-                    enabled: root.has_pending_cleanup && !root.cleanup_retry_in_progress;
+                    // Only shown when there is actually a cleanup to retry: a dead
+                    // button in the status bar reads as broken chrome.
+                    visible: root.has_pending_cleanup;
+                    enabled: !root.cleanup_retry_in_progress;
                     clicked => { root.retry_pending_cleanup(); }
                 }
             }
@@ -1449,9 +1458,9 @@ export component MainWindow inherits Window {
     // Popup: add download
     // =========================================================================
     add-popup := PopupWindow {
-        x: (root.width - 560px) / 2;
+        x: (root.width - 600px) / 2;
         y: (root.height - 520px) / 2;
-        width: 560px;
+        width: 600px;
         height: 520px;
         close-policy: no-auto-close;
 
@@ -1555,7 +1564,9 @@ export component MainWindow inherits Window {
                         }
                         VerticalLayout {
                             spacing: 4px;
-                            width: 130px;
+                            // The std ComboBox has a 160px minimum width; a narrower
+                            // column would overflow the dialog.
+                            width: 160px;
                             FieldLabel { text: "Segmentos (1-4)"; }
                             segments_box := ComboBox {
                                 model: ["1", "2", "3", "4"];
@@ -1565,8 +1576,9 @@ export component MainWindow inherits Window {
                         }
                         VerticalLayout {
                             spacing: 4px;
-                            width: 150px;
-                            FieldLabel { text: "Velocidade (KB/s, 0=∞)"; }
+                            // Same 160px floor as the other std widgets.
+                            width: 160px;
+                            FieldLabel { text: "Velocidade (KB/s)"; }
                             speed_entry := LineEdit {
                                 placeholder-text: "0";
                                 input-type: number;
@@ -1612,7 +1624,7 @@ export component MainWindow inherits Window {
                     }
 
                     Text {
-                        text: "Janela igual de início e fim significa o dia inteiro; janelas noturnas são suportadas.";
+                        text: "Janela igual de início e fim significa o dia inteiro; janelas noturnas são suportadas. Velocidade 0 significa sem limite.";
                         color: Theme.text_muted;
                         font-size: 11px;
                         wrap: word-wrap;
@@ -1678,9 +1690,9 @@ export component MainWindow inherits Window {
     // Popup: options / transfer limits
     // =========================================================================
     options-popup := PopupWindow {
-        x: (root.width - 500px) / 2;
+        x: (root.width - 560px) / 2;
         y: (root.height - 420px) / 2;
-        width: 500px;
+        width: 560px;
         height: 420px;
         close-policy: no-auto-close;
 
@@ -1741,7 +1753,8 @@ export component MainWindow inherits Window {
                         }
                         VerticalLayout {
                             spacing: 4px;
-                            width: 120px;
+                            // The std LineEdit has a 160px minimum width.
+                            width: 160px;
                             FieldLabel { text: "Segmentos (1-4)"; }
                             max_segments_entry := LineEdit {
                                 text: root.max_segments;
@@ -1785,7 +1798,7 @@ export component MainWindow inherits Window {
                         }
                         VerticalLayout {
                             spacing: 4px;
-                            width: 150px;
+                            width: 170px;
                             FieldLabel { text: "Duração máxima (minutos)"; }
                             max_duration_entry := LineEdit {
                                 text: root.max_duration_minutes;
